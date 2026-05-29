@@ -15,25 +15,41 @@ tracker:
     - Done
 polling:
   interval_ms: 5000
-server:
-  port: 4011
 workspace:
   root: ~/code/symphony-workspaces
 hooks:
   after_create: |
     git clone --depth 1 https://codeup.aliyun.com/674522743d6d6f80b4ca9da9/product/symphony-code-demo.git .
-    if command -v uv >/dev/null 2>&1; then
-      uv sync
+    if [ -d elixir ]; then
+      if command -v mise >/dev/null 2>&1; then
+        (cd elixir && mise trust && mise exec -- mix deps.get)
+      fi
+    elif [ -f package.json ]; then
+      corepack enable >/dev/null 2>&1 || true
+      if command -v pnpm >/dev/null 2>&1; then
+        pnpm install --frozen-lockfile
+      elif command -v npm >/dev/null 2>&1; then
+        npm install
+      fi
+    fi
+  before_remove: |
+    if [ -d elixir ] && command -v mise >/dev/null 2>&1; then
+      (cd elixir && mise exec -- mix workspace.before_remove)
     fi
 agent:
   max_concurrent_agents: 10
   max_turns: 20
+  max_turns_by_state:
+    Merging: 1
+  no_continuation_retry_states:
+    - Merging
 codex:
   command: codex --config shell_environment_policy.inherit=all --config 'model="gpt-5.5"' --config model_reasoning_effort=xhigh app-server
   approval_policy: never
-  thread_sandbox: workspace-write
+  # Codeup delivery needs Git metadata writes for branch creation, commit, fetch, and push.
+  thread_sandbox: danger-full-access
   turn_sandbox_policy:
-    type: workspaceWrite
+    type: dangerFullAccess
     networkAccess: true
 ---
 
@@ -78,15 +94,19 @@ The agent must be able to talk to Linear, either through a configured Linear MCP
 
 When reading the current issue through `linear_graphql`, prefer `issue(id: "{{ issue.id }}")` first, and only fall back to `issue(id: "{{ issue.identifier }}")` if needed. Do not use `issues(filter: {identifier: ...})`; the current Linear API `IssueFilter` does not support an `identifier` field. When creating comments, updating comments, or moving states, prefer the `Issue ID` above.
 
-## Prerequisite: Yunxiao MCP capability is available
+## Yunxiao / Codeup delivery capability
 
-The agent should use the Yunxiao / Codeup MCP server for repository delivery and review operations when available. The public `alibabacloud-devops-mcp-server` documents Codeup repository, branch, change request, project, and pipeline capabilities. Expected MCP capabilities include:
+The agent should use local Git for repository work first. Do not perform Yunxiao / Codeup MCP repository discovery before implementation merely to confirm the current repository, branch, or remote. The current workspace's `git remote -v`, current branch, and `git status` are the source of truth for local implementation, branch creation, commit, and push.
+
+Use the Yunxiao / Codeup MCP server only when a delivery or review operation actually requires the platform API, such as creating or inspecting a Codeup change request, reading change-request comments, or checking/running a pipeline. The public `alibabacloud-devops-mcp-server` documents Codeup repository, branch, change request, project, and pipeline capabilities. Expected MCP capabilities include:
 
 - Repository and branch inspection / creation: `get_repository`, `list_repositories`, `get_branch`, `list_branches`, `create_branch`
 - Codeup merge request / change request flow: `create_change_request`, `get_change_request`, `list_change_requests`, `list_change_request_patch_sets`, `list_change_request_comments`, `create_change_request_comment`, `compare`
 - Pipeline flow when needed: `get_pipeline`, `list_pipelines`, `smart_list_pipelines`, `create_pipeline_run`, `get_latest_pipeline_run`, `get_pipeline_run`, `list_pipeline_runs`, `list_pipeline_jobs_by_category`, `list_pipeline_job_historys`, `execute_pipeline_job_run`, `get_pipeline_job_run_log`
 
-The MCP server must be configured with a Yunxiao personal access token that has the required organization, project collaboration, code management, and pipeline permissions. If the Yunxiao MCP server, token, organization access, repository access, or required change-request capability is unavailable, record the blocker in the `## Codex Workpad`. Do not use `Done` as a fallback review state.
+When MCP parameters are needed, prefer deriving them from the existing Git remote URL and branch names. Do not call broad discovery tools such as `list_repositories` before code changes or validation. Use `list_repositories` only if the remote URL is missing, ambiguous, or rejected by a required change-request API and no narrower repository identifier is available.
+
+The MCP server must be configured with a Yunxiao personal access token that has the required organization, project collaboration, code management, and pipeline permissions. Missing Yunxiao MCP access is not a blocker for local implementation, local validation, local commit, or `git push`. If the Yunxiao MCP server, token, organization access, repository access, or required change-request capability is unavailable at the first delivery/review step that needs it, record the blocker in the `## Codex Workpad`. Do not use `Done` as a fallback review state.
 
 ## Default operating posture
 
@@ -164,6 +184,7 @@ Required Linear team states:
    - current branch
    - `git status`
    - current `HEAD`
+   - `git remote -v`
 2. If the issue is still `Todo`, move it to `In Progress` first.
 3. Load and maintain the single workpad comment as the live execution checklist.
 4. Implement against the hierarchical tasks in the workpad, and update the workpad after every meaningful milestone:
@@ -175,11 +196,19 @@ Required Linear team states:
 5. Run all required validation items.
 6. The delivery object is a Yunxiao / Codeup change request.
 7. Use local Git for code delivery: commit the implementation locally, then push the delivery branch to Codeup.
+   - Create and switch delivery branches with local Git commands in the current workspace.
+   - Use a top-level ASCII delivery branch with no Chinese characters and no slash, such as `fir-14-update-start-copy`; do not use the Linear suggested branch name when it contains Chinese text or nested path segments.
+   - Derive repository identity for later MCP calls from `git remote -v` whenever possible.
+   - Do not call Yunxiao MCP repository discovery or branch-inspection tools before local implementation, validation, commit, and push unless a local Git command fails with a concrete repository/permission error that cannot be diagnosed from Git output.
    - Do not use Yunxiao MCP file operations such as `create_file` or `update_file` as a delivery fallback.
    - If local Git commit or `git push` to Codeup is unavailable, record a blocker in the workpad. Do not create a review-only change request and do not move to `In Review`.
 8. Prefer the Yunxiao MCP `create_change_request` tool to create the change request from the delivery branch into the target baseline branch.
+   - Pass repository parameters derived from the existing remote URL before using broad repository search.
+   - Use a minimal `create_change_request` payload first: `organizationId`, `repositoryId`, `sourceBranch`, `targetBranch`, `title`, and `description`.
+   - Do not include optional fields such as `sourceProjectId`, `targetProjectId`, `createFrom`, `triggerAIReviewRun`, or `workItemIds` in the initial create call. If Linear linkage is required, record it in the workpad or perform it after the CR exists.
+   - Do not call `list_repositories` just to confirm a repository that is already present as the Git remote.
 9. After creating or finding a change request, use Yunxiao MCP inspection tools such as `get_change_request`, `list_change_request_patch_sets`, `list_change_request_comments`, and `compare` to verify that it points at the intended source branch, target branch, and latest commit.
-10. If a pipeline is required or available, use Yunxiao MCP pipeline tools to start or read the relevant pipeline and record the result or URL in the workpad.
+10. If a specific pipeline ID is provided by the ticket or workflow context, use Yunxiao MCP pipeline tools to start or read that pipeline and record the result or URL in the workpad. If no pipeline ID is provided, do not rely on fuzzy pipeline name searches; record the local validation commands as the delivery evidence.
 11. If change request creation is blocked by missing required auth, platform access, repository permissions, or tooling, record the blocker in the workpad. Do not move to `Done`.
 12. Record the delivery result in the workpad:
    - branch name

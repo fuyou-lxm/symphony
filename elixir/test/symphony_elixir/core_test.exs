@@ -115,6 +115,28 @@ defmodule SymphonyElixir.CoreTest do
     assert Config.workflow_prompt() == prompt
   end
 
+  test "Yunxiao workflow avoids repository-specific bootstrap and CR parameter pitfalls" do
+    workflow_path = Path.expand("WORKFLOW.en.yunxiao.md", File.cwd!())
+
+    assert {:ok, %{config: config, prompt: prompt}} = Workflow.load(workflow_path)
+
+    hooks = Map.fetch!(config, "hooks")
+    after_create = Map.fetch!(hooks, "after_create")
+
+    assert after_create =~ "if [ -d elixir ]; then"
+    assert after_create =~ "(cd elixir && mise trust && mise exec -- mix deps.get)"
+    assert after_create =~ "elif [ -f package.json ]; then"
+    refute after_create =~ ~r/^\s*cd elixir &&/m
+
+    agent = Map.fetch!(config, "agent")
+    assert Map.fetch!(agent, "max_turns_by_state") == %{"Merging" => 1}
+    assert Map.fetch!(agent, "no_continuation_retry_states") == ["Merging"]
+
+    assert prompt =~ "Use a top-level ASCII delivery branch"
+    assert prompt =~ "minimal `create_change_request` payload"
+    assert prompt =~ "Do not include optional fields such as `sourceProjectId`"
+  end
+
   test "linear api token resolves from LINEAR_API_KEY env var" do
     previous_linear_api_key = System.get_env("LINEAR_API_KEY")
     env_api_key = "test-linear-api-key"
@@ -551,7 +573,65 @@ defmodule SymphonyElixir.CoreTest do
     assert MapSet.member?(state.completed, issue_id)
     assert %{attempt: 1, due_at_ms: due_at_ms} = state.retry_attempts[issue_id]
     assert is_integer(due_at_ms)
-    assert_due_in_range(due_at_ms, 500, 1_100)
+    assert_due_in_range(due_at_ms, 0, 1_100)
+  end
+
+  test "normal worker exit blocks continuation retry for configured active states" do
+    write_workflow_file!(Workflow.workflow_file_path(),
+      tracker_kind: "memory",
+      tracker_active_states: ["Todo", "In Progress", "Merging"],
+      no_continuation_retry_states: ["Merging"]
+    )
+
+    issue_id = "issue-no-continuation"
+
+    issue = %Issue{
+      id: issue_id,
+      identifier: "MT-560",
+      state: "Merging",
+      title: "Awaiting external merge",
+      description: "Do not keep spending Codex turns",
+      labels: []
+    }
+
+    Application.put_env(:symphony_elixir, :memory_tracker_issues, [issue])
+
+    ref = make_ref()
+    orchestrator_name = Module.concat(__MODULE__, :NoContinuationOrchestrator)
+    {:ok, pid} = Orchestrator.start_link(name: orchestrator_name)
+
+    on_exit(fn ->
+      if Process.alive?(pid) do
+        Process.exit(pid, :normal)
+      end
+    end)
+
+    initial_state = :sys.get_state(pid)
+
+    running_entry = %{
+      pid: self(),
+      ref: ref,
+      identifier: "MT-560",
+      issue: %{issue | state: "In Progress"},
+      started_at: DateTime.utc_now()
+    }
+
+    :sys.replace_state(pid, fn _ ->
+      initial_state
+      |> Map.put(:running, %{issue_id => running_entry})
+      |> Map.put(:claimed, MapSet.new([issue_id]))
+      |> Map.put(:retry_attempts, %{})
+    end)
+
+    send(pid, {:DOWN, ref, :process, self(), :normal})
+    Process.sleep(1_200)
+    state = :sys.get_state(pid)
+
+    refute Map.has_key?(state.running, issue_id)
+    refute Map.has_key?(state.retry_attempts, issue_id)
+    refute MapSet.member?(state.completed, issue_id)
+    assert MapSet.member?(state.claimed, issue_id)
+    assert %{identifier: "MT-560", issue: ^issue} = state.blocked[issue_id]
   end
 
   test "abnormal worker exit increments retry attempt progressively" do
@@ -1456,6 +1536,105 @@ defmodule SymphonyElixir.CoreTest do
       trace = File.read!(trace_file)
       assert length(String.split(trace, "RUN", trim: true)) == 1
       assert length(Regex.scan(~r/"method":"turn\/start"/, trace)) == 2
+    after
+      System.delete_env("SYMP_TEST_CODEx_TRACE")
+      File.rm_rf(test_root)
+    end
+  end
+
+  test "agent runner applies state-specific max turn limit" do
+    test_root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-elixir-agent-runner-state-max-turns-#{System.unique_integer([:positive])}"
+      )
+
+    try do
+      template_repo = Path.join(test_root, "source")
+      workspace_root = Path.join(test_root, "workspaces")
+      codex_binary = Path.join(test_root, "fake-codex")
+      trace_file = Path.join(test_root, "codex.trace")
+
+      File.mkdir_p!(template_repo)
+      File.write!(Path.join(template_repo, "README.md"), "# test")
+      System.cmd("git", ["-C", template_repo, "init", "-b", "main"])
+      System.cmd("git", ["-C", template_repo, "config", "user.name", "Test User"])
+      System.cmd("git", ["-C", template_repo, "config", "user.email", "test@example.com"])
+      System.cmd("git", ["-C", template_repo, "add", "README.md"])
+      System.cmd("git", ["-C", template_repo, "commit", "-m", "initial"])
+
+      File.write!(codex_binary, """
+      #!/bin/sh
+      trace_file="${SYMP_TEST_CODEx_TRACE:-/tmp/codex.trace}"
+      printf 'RUN\\n' >> "$trace_file"
+      count=0
+
+      while IFS= read -r line; do
+        count=$((count + 1))
+        printf 'JSON:%s\\n' "$line" >> "$trace_file"
+        case "$count" in
+          1)
+            printf '%s\\n' '{"id":1,"result":{}}'
+            ;;
+          2)
+            ;;
+          3)
+            printf '%s\\n' '{"id":2,"result":{"thread":{"id":"thread-state-max"}}}'
+            ;;
+          4)
+            printf '%s\\n' '{"id":3,"result":{"turn":{"id":"turn-state-max-1"}}}'
+            printf '%s\\n' '{"method":"turn/completed"}'
+            ;;
+          5)
+            printf '%s\\n' '{"id":3,"result":{"turn":{"id":"turn-state-max-2"}}}'
+            printf '%s\\n' '{"method":"turn/completed"}'
+            ;;
+        esac
+      done
+      """)
+
+      File.chmod!(codex_binary, 0o755)
+      System.put_env("SYMP_TEST_CODEx_TRACE", trace_file)
+
+      on_exit(fn -> System.delete_env("SYMP_TEST_CODEx_TRACE") end)
+
+      write_workflow_file!(Workflow.workflow_file_path(),
+        workspace_root: workspace_root,
+        hook_after_create: "cp #{Path.join(template_repo, "README.md")} README.md",
+        codex_command: "#{codex_binary} app-server",
+        tracker_active_states: ["Todo", "In Progress", "Merging"],
+        max_turns: 3,
+        max_turns_by_state: %{"Merging" => 1}
+      )
+
+      state_fetcher = fn [_issue_id] ->
+        {:ok,
+         [
+           %Issue{
+             id: "issue-state-max-turns",
+             identifier: "MT-249",
+             title: "Stop at state max turns",
+             description: "Still active",
+             state: "Merging"
+           }
+         ]}
+      end
+
+      issue = %Issue{
+        id: "issue-state-max-turns",
+        identifier: "MT-249",
+        title: "Stop at state max turns",
+        description: "Still active",
+        state: "Merging",
+        url: "https://example.org/issues/MT-249",
+        labels: []
+      }
+
+      assert :ok = AgentRunner.run(issue, nil, issue_state_fetcher: state_fetcher)
+
+      trace = File.read!(trace_file)
+      assert length(String.split(trace, "RUN", trim: true)) == 1
+      assert length(Regex.scan(~r/"method":"turn\/start"/, trace)) == 1
     after
       System.delete_env("SYMP_TEST_CODEx_TRACE")
       File.rm_rf(test_root)

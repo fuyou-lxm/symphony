@@ -61,6 +61,27 @@ defmodule SymphonyElixir.Config do
 
   def max_concurrent_agents_for_state(_state_name), do: settings!().agent.max_concurrent_agents
 
+  @spec max_turns_for_state(term()) :: pos_integer()
+  def max_turns_for_state(state_name) when is_binary(state_name) do
+    config = settings!()
+
+    Map.get(
+      config.agent.max_turns_by_state,
+      Schema.normalize_issue_state(state_name),
+      config.agent.max_turns
+    )
+  end
+
+  def max_turns_for_state(_state_name), do: settings!().agent.max_turns
+
+  @spec suppress_continuation_retry_for_state?(term()) :: boolean()
+  def suppress_continuation_retry_for_state?(state_name) when is_binary(state_name) do
+    normalized_state = Schema.normalize_issue_state(state_name)
+    normalized_state in settings!().agent.no_continuation_retry_states
+  end
+
+  def suppress_continuation_retry_for_state?(_state_name), do: false
+
   @spec codex_turn_sandbox_policy(Path.t() | nil) :: map()
   def codex_turn_sandbox_policy(workspace \\ nil) do
     case Schema.resolve_runtime_turn_sandbox_policy(settings!(), workspace) do

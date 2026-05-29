@@ -28,6 +28,10 @@ hooks:
 agent:
   max_concurrent_agents: 10
   max_turns: 20
+  max_turns_by_state:
+    Merging: 1
+  no_continuation_retry_states:
+    - Merging
 codex:
   command: codex --config shell_environment_policy.inherit=all --config 'model="gpt-5.5"' --config model_reasoning_effort=xhigh app-server
   approval_policy: never

@@ -1015,6 +1015,7 @@ defmodule SymphonyElixir.Orchestrator do
     error = pick_retry_error(previous_retry, metadata)
     worker_host = pick_retry_worker_host(previous_retry, metadata)
     workspace_path = pick_retry_workspace_path(previous_retry, metadata)
+    delay_type = Map.get(metadata, :delay_type)
 
     if is_reference(old_timer) do
       Process.cancel_timer(old_timer)
@@ -1037,7 +1038,8 @@ defmodule SymphonyElixir.Orchestrator do
             identifier: identifier,
             error: error,
             worker_host: worker_host,
-            workspace_path: workspace_path
+            workspace_path: workspace_path,
+            delay_type: delay_type
           })
     }
   end
@@ -1049,7 +1051,8 @@ defmodule SymphonyElixir.Orchestrator do
           identifier: Map.get(retry_entry, :identifier),
           error: Map.get(retry_entry, :error),
           worker_host: Map.get(retry_entry, :worker_host),
-          workspace_path: Map.get(retry_entry, :workspace_path)
+          workspace_path: Map.get(retry_entry, :workspace_path),
+          delay_type: Map.get(retry_entry, :delay_type)
         }
 
         {:ok, attempt, metadata, %{state | retry_attempts: Map.delete(state.retry_attempts, issue_id)}}
@@ -1088,6 +1091,11 @@ defmodule SymphonyElixir.Orchestrator do
 
         cleanup_issue_workspace(issue.identifier, metadata[:worker_host])
         {:noreply, release_issue_claim(state, issue_id)}
+
+      suppress_continuation_retry?(issue, metadata) ->
+        Logger.info("Issue remains active but continuation retry is suppressed: #{issue_context(issue)} state=#{issue.state}; blocking until state changes")
+
+        {:noreply, block_issue_from_retry(state, issue, metadata, "continuation retry suppressed for state #{issue.state}")}
 
       retry_candidate_issue?(issue, terminal_states) ->
         handle_active_retry(state, issue, attempt, metadata)
@@ -1158,6 +1166,38 @@ defmodule SymphonyElixir.Orchestrator do
          })
        )}
     end
+  end
+
+  defp suppress_continuation_retry?(%Issue{state: state_name}, %{delay_type: :continuation})
+       when is_binary(state_name) do
+    Config.suppress_continuation_retry_for_state?(state_name)
+  end
+
+  defp suppress_continuation_retry?(_issue, _metadata), do: false
+
+  defp block_issue_from_retry(%State{} = state, %Issue{} = issue, metadata, error) do
+    blocked_entry = %{
+      issue_id: issue.id,
+      identifier: issue.identifier || metadata[:identifier] || issue.id,
+      issue: issue,
+      worker_host: Map.get(metadata, :worker_host),
+      workspace_path: Map.get(metadata, :workspace_path),
+      session_id: Map.get(metadata, :session_id),
+      error: error,
+      blocked_at: DateTime.utc_now(),
+      last_codex_message: nil,
+      last_codex_event: nil,
+      last_codex_timestamp: nil
+    }
+
+    %{
+      state
+      | running: Map.delete(state.running, issue.id),
+        retry_attempts: Map.delete(state.retry_attempts, issue.id),
+        claimed: MapSet.put(state.claimed, issue.id),
+        completed: MapSet.delete(state.completed, issue.id),
+        blocked: Map.put(state.blocked, issue.id, blocked_entry)
+    }
   end
 
   defp release_issue_claim(%State{} = state, issue_id) do

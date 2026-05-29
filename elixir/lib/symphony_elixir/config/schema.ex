@@ -131,7 +131,9 @@ defmodule SymphonyElixir.Config.Schema do
       field(:max_concurrent_agents, :integer, default: 10)
       field(:max_turns, :integer, default: 20)
       field(:max_retry_backoff_ms, :integer, default: 300_000)
+      field(:max_turns_by_state, :map, default: %{})
       field(:max_concurrent_agents_by_state, :map, default: %{})
+      field(:no_continuation_retry_states, {:array, :string}, default: [])
     end
 
     @spec changeset(%__MODULE__{}, map()) :: Ecto.Changeset.t()
@@ -139,14 +141,24 @@ defmodule SymphonyElixir.Config.Schema do
       schema
       |> cast(
         attrs,
-        [:max_concurrent_agents, :max_turns, :max_retry_backoff_ms, :max_concurrent_agents_by_state],
+        [
+          :max_concurrent_agents,
+          :max_turns,
+          :max_retry_backoff_ms,
+          :max_turns_by_state,
+          :max_concurrent_agents_by_state,
+          :no_continuation_retry_states
+        ],
         empty_values: []
       )
       |> validate_number(:max_concurrent_agents, greater_than: 0)
       |> validate_number(:max_turns, greater_than: 0)
       |> validate_number(:max_retry_backoff_ms, greater_than: 0)
+      |> update_change(:max_turns_by_state, &Schema.normalize_state_limits/1)
       |> update_change(:max_concurrent_agents_by_state, &Schema.normalize_state_limits/1)
+      |> Schema.validate_state_limits(:max_turns_by_state)
       |> Schema.validate_state_limits(:max_concurrent_agents_by_state)
+      |> update_change(:no_continuation_retry_states, &Schema.normalize_state_names/1)
     end
   end
 
@@ -330,6 +342,17 @@ defmodule SymphonyElixir.Config.Schema do
     Enum.reduce(limits, %{}, fn {state_name, limit}, acc ->
       Map.put(acc, normalize_issue_state(to_string(state_name)), limit)
     end)
+  end
+
+  @doc false
+  @spec normalize_state_names(nil | [term()]) :: [String.t()]
+  def normalize_state_names(nil), do: []
+
+  def normalize_state_names(states) when is_list(states) do
+    states
+    |> Enum.map(fn state -> normalize_issue_state(to_string(state)) end)
+    |> Enum.reject(&(&1 == ""))
+    |> Enum.uniq()
   end
 
   @doc false
