@@ -13,6 +13,9 @@
 │   ───────────────────────────────────────────────────────────────────────────────────────────────────────────────
 │  No active agents
 │
+├─ External waiting
+│
+│  No external waits
 ├─ Backoff queue
 │
 │  No queued retries

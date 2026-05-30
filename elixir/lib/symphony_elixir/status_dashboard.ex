@@ -309,12 +309,14 @@ defmodule SymphonyElixir.StatusDashboard do
     case snapshot_payload() do
       {:ok, %{running: running, retrying: retrying, codex_totals: codex_totals} = snapshot} ->
         total_tokens = Map.get(codex_totals, :total_tokens, 0)
+        external_waiting = Map.get(snapshot, :external_waiting, [])
 
         {
           {:ok,
            %{
              running: running,
              retrying: retrying,
+             external_waiting: external_waiting,
              codex_totals: codex_totals,
              rate_limits: Map.get(snapshot, :rate_limits),
              polling: Map.get(snapshot, :polling)
@@ -334,6 +336,7 @@ defmodule SymphonyElixir.StatusDashboard do
     case snapshot_data do
       {:ok, %{running: running, retrying: retrying, codex_totals: codex_totals} = snapshot} ->
         rate_limits = Map.get(snapshot, :rate_limits)
+        external_waiting = Map.get(snapshot, :external_waiting, [])
         project_link_lines = format_project_link_lines()
         project_refresh_line = format_project_refresh_line(Map.get(snapshot, :polling))
         codex_input_tokens = Map.get(codex_totals, :input_tokens, 0)
@@ -345,6 +348,8 @@ defmodule SymphonyElixir.StatusDashboard do
         running_event_width = running_event_width(terminal_columns_override)
         running_rows = format_running_rows(running, running_event_width)
         running_to_backoff_spacer = if(running == [], do: [], else: ["│"])
+        external_waiting_rows = format_external_waiting_rows(external_waiting)
+        external_waiting_to_backoff_spacer = if(external_waiting == [], do: [], else: ["│"])
         backoff_rows = format_retry_rows(retrying)
 
         ([
@@ -372,6 +377,9 @@ defmodule SymphonyElixir.StatusDashboard do
          ] ++
            running_rows ++
            running_to_backoff_spacer ++
+           [colorize("├─ External waiting", @ansi_bold), "│"] ++
+           external_waiting_rows ++
+           external_waiting_to_backoff_spacer ++
            [colorize("├─ Backoff queue", @ansi_bold), "│"] ++
            backoff_rows ++
            [closing_border()])
@@ -560,6 +568,7 @@ defmodule SymphonyElixir.StatusDashboard do
            %{
              running: running,
              retrying: retrying,
+             external_waiting: Map.get(snapshot, :external_waiting, []),
              codex_totals: codex_totals,
              rate_limits: Map.get(snapshot, :rate_limits),
              polling: Map.get(snapshot, :polling)
@@ -671,6 +680,80 @@ defmodule SymphonyElixir.StatusDashboard do
       colorize(next_in_words(due_in_ms), @ansi_cyan) <>
       error
   end
+
+  defp format_external_waiting_rows(external_waiting) do
+    if external_waiting == [] do
+      ["│  " <> colorize("No external waits", @ansi_gray)]
+    else
+      external_waiting
+      |> Enum.sort_by(&external_waiting_sort_key/1)
+      |> Enum.map(&format_external_waiting_summary/1)
+    end
+  end
+
+  defp external_waiting_sort_key(entry) do
+    {Map.get(entry, :identifier) || Map.get(entry, :issue_id) || "", Map.get(entry, :change_request_id) || ""}
+  end
+
+  defp format_external_waiting_summary(entry) do
+    issue_id = Map.get(entry, :issue_id) || "unknown"
+    identifier = Map.get(entry, :identifier) || issue_id
+    provider = Map.get(entry, :provider) || "external"
+    change_request_id = Map.get(entry, :change_request_id) || "unknown"
+    state = Map.get(entry, :state) || "unknown"
+    cr_status = Map.get(entry, :cr_status) || "pending"
+    token_policy = format_external_value(Map.get(entry, :token_policy) || "no_codex")
+    next_action = format_external_value(Map.get(entry, :next_action) || "wait")
+    last_checked = format_external_checked_at(Map.get(entry, :last_checked_at))
+    error = format_external_waiting_error(Map.get(entry, :error))
+
+    "│  " <>
+      colorize("◆", @ansi_cyan) <>
+      " " <>
+      colorize("#{identifier}", @ansi_cyan) <>
+      " " <>
+      colorize("state=#{state}", @ansi_magenta) <>
+      " " <>
+      colorize("#{provider}##{change_request_id}", @ansi_yellow) <>
+      " " <>
+      colorize("cr=#{cr_status}", @ansi_green) <>
+      " " <>
+      colorize("policy=#{token_policy}", @ansi_gray) <>
+      " " <>
+      colorize("checked=#{last_checked}", @ansi_gray) <>
+      " " <>
+      colorize("next=#{next_action}", @ansi_gray) <>
+      error
+  end
+
+  defp format_external_checked_at(%DateTime{} = datetime), do: format_timestamp(datetime)
+  defp format_external_checked_at(value) when is_binary(value) and value != "", do: value
+  defp format_external_checked_at(_value), do: "n/a"
+
+  defp format_external_value(value) when is_atom(value), do: Atom.to_string(value)
+  defp format_external_value(value) when is_binary(value), do: value
+  defp format_external_value(value), do: to_string(value)
+
+  defp format_external_waiting_error(error) when is_binary(error) do
+    sanitized =
+      error
+      |> String.replace("\\r\\n", " ")
+      |> String.replace("\\r", " ")
+      |> String.replace("\\n", " ")
+      |> String.replace("\r\n", " ")
+      |> String.replace("\r", " ")
+      |> String.replace("\n", " ")
+      |> String.replace(~r/\s+/, " ")
+      |> String.trim()
+
+    if sanitized == "" do
+      ""
+    else
+      " " <> colorize("error=#{truncate(sanitized, 96)}", @ansi_red)
+    end
+  end
+
+  defp format_external_waiting_error(_error), do: ""
 
   defp next_in_words(due_in_ms) when is_integer(due_in_ms) do
     secs = div(due_in_ms, 1000)

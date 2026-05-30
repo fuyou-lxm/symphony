@@ -1227,7 +1227,7 @@ defmodule SymphonyElixir.OrchestratorStatusTest do
     assert checking_rendered =~ "checking now…"
   end
 
-  test "status dashboard adds a spacer line before backoff queue when no agents are active" do
+  test "status dashboard separates running, external waiting, and backoff queue when no agents are active" do
     snapshot_data =
       {:ok,
        %{
@@ -1240,10 +1240,10 @@ defmodule SymphonyElixir.OrchestratorStatusTest do
     rendered = StatusDashboard.format_snapshot_content_for_test(snapshot_data, 0.0)
     plain = Regex.replace(~r/\e\[[0-9;]*m/, rendered, "")
 
-    assert plain =~ ~r/No active agents\r?\n│\s*\r?\n├─ Backoff queue/
+    assert plain =~ ~r/No active agents\r?\n│\s*\r?\n├─ External waiting\r?\n│\s*\r?\n│\s*No external waits\r?\n├─ Backoff queue/
   end
 
-  test "status dashboard adds a spacer line before backoff queue when agents are active" do
+  test "status dashboard separates running, external waiting, and backoff queue when agents are active" do
     snapshot_data =
       {:ok,
        %{
@@ -1279,7 +1279,7 @@ defmodule SymphonyElixir.OrchestratorStatusTest do
     rendered = StatusDashboard.format_snapshot_content_for_test(snapshot_data, 0.0)
     plain = Regex.replace(~r/\e\[[0-9;]*m/, rendered, "")
 
-    assert plain =~ ~r/MT-777.*\r?\n│\s*\r?\n├─ Backoff queue/s
+    assert plain =~ ~r/MT-777.*\r?\n│\s*\r?\n├─ External waiting\r?\n│\s*\r?\n│\s*No external waits\r?\n├─ Backoff queue/s
   end
 
   test "status dashboard renders an unstyled closing corner when the retry queue is empty" do

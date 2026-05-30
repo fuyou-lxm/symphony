@@ -42,7 +42,12 @@ defmodule SymphonyElixir.TestSupport do
           Application.delete_env(:symphony_elixir, :workflow_file_path)
           Application.delete_env(:symphony_elixir, :server_port_override)
           Application.delete_env(:symphony_elixir, :memory_tracker_issues)
+          Application.delete_env(:symphony_elixir, :memory_tracker_comments)
           Application.delete_env(:symphony_elixir, :memory_tracker_recipient)
+          Application.delete_env(:symphony_elixir, :external_merge_watcher)
+          Application.delete_env(:symphony_elixir, :external_merge_watcher_result)
+          Application.delete_env(:symphony_elixir, :external_merge_watcher_recipient)
+          Application.delete_env(:symphony_elixir, :yunxiao_access_token)
           File.rm_rf(workflow_root)
         end)
 
@@ -148,6 +153,7 @@ defmodule SymphonyElixir.TestSupport do
     max_turns_by_state = Keyword.get(config, :max_turns_by_state)
     max_concurrent_agents_by_state = Keyword.get(config, :max_concurrent_agents_by_state)
     no_continuation_retry_states = Keyword.get(config, :no_continuation_retry_states)
+    no_auto_codex_states = Keyword.get(config, :no_auto_codex_states)
     codex_command = Keyword.get(config, :codex_command)
     codex_approval_policy = Keyword.get(config, :codex_approval_policy)
     codex_thread_sandbox = Keyword.get(config, :codex_thread_sandbox)
@@ -190,6 +196,7 @@ defmodule SymphonyElixir.TestSupport do
         "  max_turns_by_state: #{yaml_value(max_turns_by_state)}",
         "  max_concurrent_agents_by_state: #{yaml_value(max_concurrent_agents_by_state)}",
         "  no_continuation_retry_states: #{yaml_value(no_continuation_retry_states)}",
+        "  no_auto_codex_states: #{yaml_value(no_auto_codex_states)}",
         "codex:",
         "  command: #{yaml_value(codex_command)}",
         "  approval_policy: #{yaml_value(codex_approval_policy)}",

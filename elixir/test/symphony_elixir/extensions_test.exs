@@ -342,7 +342,7 @@ defmodule SymphonyElixir.ExtensionsTest do
 
     assert state_payload == %{
              "generated_at" => state_payload["generated_at"],
-             "counts" => %{"running" => 1, "retrying" => 1, "blocked" => 1},
+             "counts" => %{"running" => 1, "retrying" => 1, "blocked" => 1, "external_waiting" => 1},
              "running" => [
                %{
                  "issue_id" => "issue-http",
@@ -385,6 +385,24 @@ defmodule SymphonyElixir.ExtensionsTest do
                  "last_event_at" => state_payload["blocked"] |> List.first() |> Map.fetch!("last_event_at")
                }
              ],
+             "external_waiting" => [
+               %{
+                 "issue_id" => "issue-external",
+                 "issue_identifier" => "MT-EXTERNAL",
+                 "linear_state" => "Merging",
+                 "provider" => "codeup",
+                 "change_request" => "4",
+                 "cr_status" => "TO_BE_MERGED",
+                 "revision" => nil,
+                 "observed_key" => "codeup:org-123:6907286:4:TO_BE_MERGED:no-revision",
+                 "token_policy" => "no_codex",
+                 "next_action" => "needs_human",
+                 "error" => "metadata_missing",
+                 "waiting_since" => state_payload["external_waiting"] |> List.first() |> Map.fetch!("waiting_since"),
+                 "last_checked_at" => state_payload["external_waiting"] |> List.first() |> Map.fetch!("last_checked_at"),
+                 "url" => "https://codeup.example/change/4"
+               }
+             ],
              "codex_totals" => %{
                "input_tokens" => 4,
                "output_tokens" => 8,
@@ -420,6 +438,7 @@ defmodule SymphonyElixir.ExtensionsTest do
              },
              "retry" => nil,
              "blocked" => nil,
+             "external_waiting" => nil,
              "logs" => %{"codex_session_logs" => []},
              "recent_events" => [],
              "last_error" => nil,
@@ -441,6 +460,26 @@ defmodule SymphonyElixir.ExtensionsTest do
                "state" => "In Progress",
                "error" => "codex turn requires operator input"
              }
+           } = json_response(conn, 200)
+
+    conn = get(build_conn(), "/api/v1/MT-EXTERNAL")
+
+    assert %{
+             "status" => "external_waiting",
+             "last_error" => "metadata_missing",
+             "external_waiting" => %{
+               "linear_state" => "Merging",
+               "provider" => "codeup",
+               "change_request" => "4",
+               "cr_status" => "TO_BE_MERGED",
+               "observed_key" => "codeup:org-123:6907286:4:TO_BE_MERGED:no-revision",
+               "token_policy" => "no_codex",
+               "next_action" => "needs_human",
+               "error" => "metadata_missing"
+             },
+             "running" => nil,
+             "retry" => nil,
+             "blocked" => nil
            } = json_response(conn, 200)
 
     conn = get(build_conn(), "/api/v1/MT-MISSING")
@@ -571,6 +610,11 @@ defmodule SymphonyElixir.ExtensionsTest do
     assert html =~ "MT-HTTP"
     assert html =~ "MT-RETRY"
     assert html =~ "MT-BLOCKED"
+    assert html =~ "MT-EXTERNAL"
+    assert html =~ "External waiting"
+    assert html =~ "TO_BE_MERGED"
+    assert html =~ "no_codex"
+    assert html =~ "metadata_missing"
     assert html =~ "rendered"
     assert html =~ "turn blocked: waiting for user input"
     assert html =~ "Runtime"
@@ -671,7 +715,7 @@ defmodule SymphonyElixir.ExtensionsTest do
 
     response = Req.get!("http://127.0.0.1:#{port}/api/v1/state")
     assert response.status == 200
-    assert response.body["counts"] == %{"running" => 1, "retrying" => 1, "blocked" => 1}
+    assert response.body["counts"] == %{"running" => 1, "retrying" => 1, "blocked" => 1, "external_waiting" => 1}
 
     dashboard_css = Req.get!("http://127.0.0.1:#{port}/dashboard.css")
     assert dashboard_css.status == 200
@@ -758,6 +802,24 @@ defmodule SymphonyElixir.ExtensionsTest do
             timestamp: DateTime.utc_now()
           },
           last_codex_timestamp: DateTime.utc_now()
+        }
+      ],
+      external_waiting: [
+        %{
+          issue_id: "issue-external",
+          identifier: "MT-EXTERNAL",
+          state: "Merging",
+          provider: "codeup",
+          change_request_id: "4",
+          cr_status: "TO_BE_MERGED",
+          revision: nil,
+          observed_key: "codeup:org-123:6907286:4:TO_BE_MERGED:no-revision",
+          token_policy: :no_codex,
+          next_action: :needs_human,
+          error: "metadata_missing",
+          waiting_since: DateTime.utc_now(),
+          last_checked_at: DateTime.utc_now(),
+          url: "https://codeup.example/change/4"
         }
       ],
       codex_totals: %{input_tokens: 4, output_tokens: 8, total_tokens: 12, seconds_running: 42.5},

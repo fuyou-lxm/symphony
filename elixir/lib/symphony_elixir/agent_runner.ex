@@ -102,24 +102,17 @@ defmodule SymphonyElixir.AgentRunner do
       Logger.info("Completed agent run for #{issue_context(issue)} session_id=#{turn_session[:session_id]} workspace=#{workspace} turn=#{turn_number}/#{max_turns}")
 
       case continue_with_issue?(issue, issue_state_fetcher) do
-        {:continue, refreshed_issue} when turn_number < max_turns ->
-          Logger.info("Continuing agent run for #{issue_context(refreshed_issue)} after normal turn completion turn=#{turn_number}/#{max_turns}")
-
-          do_run_codex_turns(
+        {:continue, refreshed_issue} ->
+          maybe_continue_active_issue(
             app_session,
             workspace,
             refreshed_issue,
             codex_update_recipient,
             opts,
             issue_state_fetcher,
-            turn_number + 1,
+            turn_number,
             max_turns
           )
-
-        {:continue, refreshed_issue} ->
-          Logger.info("Reached agent.max_turns for #{issue_context(refreshed_issue)} with issue still active; returning control to orchestrator")
-
-          :ok
 
         {:done, _refreshed_issue} ->
           :ok
@@ -128,6 +121,47 @@ defmodule SymphonyElixir.AgentRunner do
           {:error, reason}
       end
     end
+  end
+
+  defp maybe_continue_active_issue(app_session, workspace, refreshed_issue, codex_update_recipient, opts, issue_state_fetcher, turn_number, max_turns) do
+    if Config.no_auto_codex_for_state?(refreshed_issue.state) do
+      Logger.info("Stopping in-process continuation for #{issue_context(refreshed_issue)} state=#{refreshed_issue.state}; no-auto-Codex policy is active")
+
+      :ok
+    else
+      continue_active_issue(
+        app_session,
+        workspace,
+        refreshed_issue,
+        codex_update_recipient,
+        opts,
+        issue_state_fetcher,
+        turn_number,
+        max_turns
+      )
+    end
+  end
+
+  defp continue_active_issue(app_session, workspace, refreshed_issue, codex_update_recipient, opts, issue_state_fetcher, turn_number, max_turns)
+       when turn_number < max_turns do
+    Logger.info("Continuing agent run for #{issue_context(refreshed_issue)} after normal turn completion turn=#{turn_number}/#{max_turns}")
+
+    do_run_codex_turns(
+      app_session,
+      workspace,
+      refreshed_issue,
+      codex_update_recipient,
+      opts,
+      issue_state_fetcher,
+      turn_number + 1,
+      max_turns
+    )
+  end
+
+  defp continue_active_issue(_app_session, _workspace, refreshed_issue, _codex_update_recipient, _opts, _issue_state_fetcher, _turn_number, _max_turns) do
+    Logger.info("Reached agent.max_turns for #{issue_context(refreshed_issue)} with issue still active; returning control to orchestrator")
+
+    :ok
   end
 
   defp build_turn_prompt(issue, opts, 1, _max_turns), do: PromptBuilder.build_prompt(issue, opts)

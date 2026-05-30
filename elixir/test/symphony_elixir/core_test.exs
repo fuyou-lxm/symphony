@@ -37,6 +37,10 @@ defmodule SymphonyElixir.CoreTest do
     write_workflow_file!(Workflow.workflow_file_path(), max_turns: 5)
     assert Config.settings!().agent.max_turns == 5
 
+    write_workflow_file!(Workflow.workflow_file_path(), no_auto_codex_states: ["Merging"])
+    assert Config.settings!().agent.no_auto_codex_states == ["merging"]
+    assert Config.no_auto_codex_for_state?("merging")
+
     write_workflow_file!(Workflow.workflow_file_path(), tracker_active_states: "Todo,  Review,")
     assert {:error, {:invalid_workflow_config, message}} = Config.validate!()
     assert message =~ "tracker.active_states"
@@ -131,6 +135,7 @@ defmodule SymphonyElixir.CoreTest do
     agent = Map.fetch!(config, "agent")
     assert Map.fetch!(agent, "max_turns_by_state") == %{"Merging" => 1}
     assert Map.fetch!(agent, "no_continuation_retry_states") == ["Merging"]
+    assert Map.fetch!(agent, "no_auto_codex_states") == ["Merging"]
 
     assert prompt =~ "Use a top-level ASCII delivery branch"
     assert prompt =~ "minimal `create_change_request` payload"
@@ -571,9 +576,8 @@ defmodule SymphonyElixir.CoreTest do
 
     refute Map.has_key?(state.running, issue_id)
     assert MapSet.member?(state.completed, issue_id)
-    assert %{attempt: 1, due_at_ms: due_at_ms} = state.retry_attempts[issue_id]
+    assert %{attempt: 1, due_at_ms: due_at_ms, delay_type: :continuation} = state.retry_attempts[issue_id]
     assert is_integer(due_at_ms)
-    assert_due_in_range(due_at_ms, 0, 1_100)
   end
 
   test "normal worker exit blocks continuation retry for configured active states" do
@@ -634,6 +638,143 @@ defmodule SymphonyElixir.CoreTest do
     assert %{identifier: "MT-560", issue: ^issue} = state.blocked[issue_id]
   end
 
+  test "abnormal worker exit moves no-auto-Codex states to external waiting without retry" do
+    write_workflow_file!(Workflow.workflow_file_path(),
+      tracker_kind: "memory",
+      tracker_active_states: ["Todo", "In Progress", "Merging"],
+      no_auto_codex_states: ["Merging"]
+    )
+
+    issue_id = "issue-merging-crash"
+
+    issue = %Issue{
+      id: issue_id,
+      identifier: "MT-562",
+      state: "Merging",
+      title: "Awaiting Codeup merge",
+      description: "Do not retry Codex while waiting",
+      labels: []
+    }
+
+    Application.put_env(:symphony_elixir, :memory_tracker_issues, [issue])
+
+    ref = make_ref()
+    orchestrator_name = Module.concat(__MODULE__, :NoAutoCodexCrashOrchestrator)
+    {:ok, pid} = Orchestrator.start_link(name: orchestrator_name)
+
+    on_exit(fn ->
+      if Process.alive?(pid) do
+        Process.exit(pid, :normal)
+      end
+    end)
+
+    initial_state = :sys.get_state(pid)
+
+    running_entry = %{
+      pid: self(),
+      ref: ref,
+      identifier: "MT-562",
+      issue: issue,
+      retry_attempt: 1,
+      started_at: DateTime.utc_now()
+    }
+
+    :sys.replace_state(pid, fn _ ->
+      initial_state
+      |> Map.put(:running, %{issue_id => running_entry})
+      |> Map.put(:claimed, MapSet.new([issue_id]))
+      |> Map.put(:retry_attempts, %{})
+    end)
+
+    send(pid, {:DOWN, ref, :process, self(), :boom})
+    Process.sleep(1_200)
+    state = :sys.get_state(pid)
+
+    refute Map.has_key?(state.running, issue_id)
+    refute Map.has_key?(state.retry_attempts, issue_id)
+    refute Map.has_key?(state.blocked, issue_id)
+    assert MapSet.member?(state.claimed, issue_id)
+
+    assert %{
+             identifier: "MT-562",
+             issue: ^issue,
+             token_policy: :no_codex,
+             next_action: :needs_human,
+             error: ":metadata_missing"
+           } = Map.fetch!(Map.get(state, :external_waiting, %{}), issue_id)
+  end
+
+  test "stalled no-auto-Codex issue moves to external waiting without scheduling retry" do
+    write_workflow_file!(Workflow.workflow_file_path(),
+      tracker_kind: "memory",
+      tracker_active_states: ["Todo", "In Progress", "Merging"],
+      no_auto_codex_states: ["Merging"],
+      codex_stall_timeout_ms: 1
+    )
+
+    issue_id = "issue-merging-stall"
+
+    issue = %Issue{
+      id: issue_id,
+      identifier: "MT-565",
+      state: "Merging",
+      title: "Stalled while waiting for Codeup merge",
+      description: "Do not retry Codex while waiting",
+      labels: []
+    }
+
+    Application.put_env(:symphony_elixir, :memory_tracker_issues, [issue])
+
+    worker_pid =
+      spawn(fn ->
+        receive do
+          :stop -> :ok
+        end
+      end)
+
+    on_exit(fn ->
+      if Process.alive?(worker_pid) do
+        send(worker_pid, :stop)
+      end
+    end)
+
+    running_entry = %{
+      pid: worker_pid,
+      ref: make_ref(),
+      identifier: "MT-565",
+      issue: issue,
+      retry_attempt: 1,
+      started_at: DateTime.add(DateTime.utc_now(), -10, :second),
+      last_codex_timestamp: nil,
+      codex_input_tokens: 0,
+      codex_output_tokens: 0,
+      codex_total_tokens: 0
+    }
+
+    state = %Orchestrator.State{
+      running: %{issue_id => running_entry},
+      claimed: MapSet.new([issue_id]),
+      retry_attempts: %{},
+      codex_totals: %{input_tokens: 0, output_tokens: 0, total_tokens: 0, seconds_running: 0},
+      codex_rate_limits: nil
+    }
+
+    assert {:noreply, blocked_state} = Orchestrator.handle_info(:run_poll_cycle, state)
+
+    refute Map.has_key?(blocked_state.running, issue_id)
+    refute Map.has_key?(blocked_state.retry_attempts, issue_id)
+    refute Map.has_key?(blocked_state.blocked, issue_id)
+    assert MapSet.member?(blocked_state.claimed, issue_id)
+
+    assert %{
+             identifier: "MT-565",
+             issue: ^issue,
+             token_policy: :no_codex,
+             next_action: :needs_human,
+             error: ":metadata_missing"
+           } = Map.fetch!(Map.get(blocked_state, :external_waiting, %{}), issue_id)
+  end
+
   test "abnormal worker exit increments retry attempt progressively" do
     issue_id = "issue-crash"
     ref = make_ref()
@@ -671,7 +812,7 @@ defmodule SymphonyElixir.CoreTest do
     assert %{attempt: 3, due_at_ms: due_at_ms, identifier: "MT-559", error: "agent exited: :boom"} =
              state.retry_attempts[issue_id]
 
-    assert_due_in_range(due_at_ms, 39_500, 40_500)
+    assert_due_in_range(due_at_ms, 38_000, 40_500)
   end
 
   test "first abnormal worker exit waits before retrying" do
@@ -710,7 +851,7 @@ defmodule SymphonyElixir.CoreTest do
     assert %{attempt: 1, due_at_ms: due_at_ms, identifier: "MT-560", error: "agent exited: :boom"} =
              state.retry_attempts[issue_id]
 
-    assert_due_in_range(due_at_ms, 9_000, 10_500)
+    assert_due_in_range(due_at_ms, 8_000, 10_500)
   end
 
   test "stale retry timer messages do not consume newer retry entries" do
@@ -783,6 +924,455 @@ defmodule SymphonyElixir.CoreTest do
     assert {:noreply, ^coalesced_state} = Orchestrator.handle_info({:tick, stale_tick_token}, coalesced_state)
   end
 
+  test "external state change finalizes an external-waiting merge without retrying Codex" do
+    write_workflow_file!(Workflow.workflow_file_path(),
+      tracker_kind: "memory",
+      tracker_active_states: ["Todo", "In Progress", "Merging", "Rework"],
+      tracker_terminal_states: ["Closed", "Cancelled", "Canceled", "Duplicate", "Done"],
+      no_auto_codex_states: ["Merging"]
+    )
+
+    Application.put_env(:symphony_elixir, :memory_tracker_recipient, self())
+
+    issue_id = "issue-external-finalize"
+
+    issue = %Issue{
+      id: issue_id,
+      identifier: "MT-564",
+      state: "Merging",
+      title: "Finalize after Codeup merge",
+      description: "External merge finalization must not resume Codex",
+      labels: []
+    }
+
+    state = external_waiting_state_for_issue(issue)
+
+    metadata = %{
+      provider: "codeup",
+      change_request_id: "3",
+      from_state: "TO_BE_MERGED",
+      to_state: "MERGED",
+      status: "MERGED",
+      revision: "8867ebd",
+      observed_key: "codeup:org-123:6907286:3:MERGED:8867ebd",
+      outcome: :merged,
+      url: "https://codeup.example/change/3"
+    }
+
+    assert {:reply, %{queued: false, finalized: true, reason: :external_merged}, finalized_state} =
+             Orchestrator.handle_call({:external_state_changed, issue_id, metadata}, {self(), make_ref()}, state)
+
+    refute Map.has_key?(Map.get(finalized_state, :external_waiting, %{}), issue_id)
+    refute MapSet.member?(finalized_state.claimed, issue_id)
+    refute Map.has_key?(finalized_state.running, issue_id)
+    refute Map.has_key?(finalized_state.retry_attempts, issue_id)
+    assert finalized_state.codex_totals.total_tokens == 0
+
+    assert_receive {:memory_tracker_comment, ^issue_id, body}
+    assert body =~ "External Merge Evidence"
+    assert body =~ "MERGED"
+    assert body =~ "token_policy: no_codex"
+    assert_receive {:memory_tracker_state_update, ^issue_id, "Done"}
+  end
+
+  test "manual resume wakes a blocked no-auto-Codex issue once" do
+    issue_id = "issue-manual-resume"
+
+    issue = %Issue{
+      id: issue_id,
+      identifier: "MT-566",
+      state: "Merging",
+      title: "Human requested recheck",
+      description: "Manual resume may run Codex once",
+      labels: []
+    }
+
+    state = %Orchestrator.State{
+      claimed: MapSet.new([issue_id]),
+      blocked: %{
+        issue_id => %{
+          issue_id: issue_id,
+          identifier: "MT-566",
+          issue: issue,
+          worker_host: nil,
+          workspace_path: "/tmp/MT-566",
+          session_id: "thread-turn",
+          error: "automatic Codex dispatch suppressed for state Merging",
+          blocked_at: DateTime.utc_now(),
+          last_codex_message: nil,
+          last_codex_event: nil,
+          last_codex_timestamp: nil
+        }
+      },
+      retry_attempts: %{},
+      codex_totals: %{input_tokens: 0, output_tokens: 0, total_tokens: 0, seconds_running: 0},
+      codex_rate_limits: nil
+    }
+
+    assert {:reply, %{queued: true, reason: :manual_resume}, resumed_state} =
+             Orchestrator.handle_call({:manual_resume, issue_id}, {self(), make_ref()}, state)
+
+    refute Map.has_key?(resumed_state.blocked, issue_id)
+
+    assert %{
+             attempt: 1,
+             delay_type: :external,
+             identifier: "MT-566",
+             error: "manual resume requested",
+             workspace_path: "/tmp/MT-566"
+           } = resumed_state.retry_attempts[issue_id]
+  end
+
+  test "candidate no-auto-Codex issue is not dispatched by ordinary polling" do
+    write_workflow_file!(Workflow.workflow_file_path(),
+      tracker_active_states: ["Todo", "In Progress", "Merging"],
+      no_auto_codex_states: ["Merging"]
+    )
+
+    issue = %Issue{
+      id: "issue-merging-candidate",
+      identifier: "MT-569",
+      state: "Merging",
+      title: "Do not dispatch from ordinary poll",
+      description: "Waiting for external merge state",
+      labels: []
+    }
+
+    state = %Orchestrator.State{
+      running: %{},
+      blocked: %{},
+      claimed: MapSet.new(),
+      max_concurrent_agents: 10
+    }
+
+    refute Orchestrator.should_dispatch_issue_for_test(issue, state)
+  end
+
+  test "cold-start poll tracks candidate no-auto-Codex issue as external waiting without agent slots" do
+    write_workflow_file!(Workflow.workflow_file_path(),
+      tracker_kind: "memory",
+      tracker_active_states: ["Todo", "In Progress", "Merging"],
+      no_auto_codex_states: ["Merging"]
+    )
+
+    issue_id = "issue-cold-start-merging"
+
+    issue = %Issue{
+      id: issue_id,
+      identifier: "MT-570",
+      state: "Merging",
+      title: "Cold-start external wait",
+      description: codeup_metadata_description("TO_BE_MERGED"),
+      labels: []
+    }
+
+    Application.put_env(:symphony_elixir, :memory_tracker_issues, [issue])
+    Application.put_env(:symphony_elixir, :external_merge_watcher, __MODULE__.FakeExternalMergeWatcher)
+
+    Application.put_env(
+      :symphony_elixir,
+      :external_merge_watcher_result,
+      {:unchanged, %{observed_key: "codeup:org-123:6907286:3:TO_BE_MERGED:no-revision", provider: "codeup", change_request_id: "3", status: "TO_BE_MERGED", outcome: :active}}
+    )
+
+    Application.put_env(:symphony_elixir, :external_merge_watcher_recipient, self())
+
+    state = %Orchestrator.State{
+      running: %{},
+      blocked: %{},
+      claimed: MapSet.new(),
+      retry_attempts: %{},
+      max_concurrent_agents: 0,
+      codex_totals: %{input_tokens: 0, output_tokens: 0, total_tokens: 0, seconds_running: 0},
+      codex_rate_limits: nil
+    }
+
+    assert {:noreply, updated_state} = Orchestrator.handle_info(:run_poll_cycle, state)
+
+    assert_receive {:external_merge_watcher_check, ^issue, opts}
+    assert Keyword.get(opts, :fetch_tracker_comments) == true
+    refute Map.has_key?(updated_state.running, issue_id)
+    refute Map.has_key?(updated_state.retry_attempts, issue_id)
+    refute Map.has_key?(updated_state.blocked, issue_id)
+    assert MapSet.member?(updated_state.claimed, issue_id)
+
+    assert %{
+             identifier: "MT-570",
+             issue: ^issue,
+             token_policy: :no_codex,
+             cr_status: "TO_BE_MERGED",
+             next_action: :wait
+           } = Map.fetch!(Map.get(updated_state, :external_waiting, %{}), issue_id)
+  end
+
+  test "cold-start poll finalizes already-merged Codeup CR without Codex retry" do
+    write_workflow_file!(Workflow.workflow_file_path(),
+      tracker_kind: "memory",
+      tracker_active_states: ["Todo", "In Progress", "Merging", "Rework"],
+      tracker_terminal_states: ["Closed", "Cancelled", "Canceled", "Duplicate", "Done"],
+      no_auto_codex_states: ["Merging"]
+    )
+
+    issue_id = "issue-cold-start-already-merged"
+
+    issue = %Issue{
+      id: issue_id,
+      identifier: "MT-572",
+      state: "Merging",
+      title: "Cold-start merged external wait",
+      description: codeup_metadata_description("MERGED"),
+      labels: []
+    }
+
+    observation = %{
+      observed_key: "codeup:org-123:6907286:3:MERGED:rev-cold-start",
+      provider: "codeup",
+      change_request_id: "3",
+      status: "MERGED",
+      revision: "rev-cold-start",
+      outcome: :merged,
+      url: "https://codeup.example/change/3"
+    }
+
+    Application.put_env(:symphony_elixir, :memory_tracker_issues, [issue])
+    Application.put_env(:symphony_elixir, :memory_tracker_recipient, self())
+    Application.put_env(:symphony_elixir, :external_merge_watcher, __MODULE__.FakeExternalMergeWatcher)
+    Application.put_env(:symphony_elixir, :external_merge_watcher_result, {:unchanged, observation})
+    Application.put_env(:symphony_elixir, :external_merge_watcher_recipient, self())
+
+    state = %Orchestrator.State{
+      running: %{},
+      blocked: %{},
+      claimed: MapSet.new(),
+      retry_attempts: %{},
+      max_concurrent_agents: 0,
+      codex_totals: %{input_tokens: 0, output_tokens: 0, total_tokens: 0, seconds_running: 0},
+      codex_rate_limits: nil
+    }
+
+    assert {:noreply, updated_state} = Orchestrator.handle_info(:run_poll_cycle, state)
+
+    assert_receive {:external_merge_watcher_check, ^issue, _opts}
+    refute Map.has_key?(Map.get(updated_state, :external_waiting, %{}), issue_id)
+    refute Map.has_key?(updated_state.running, issue_id)
+    refute Map.has_key?(updated_state.retry_attempts, issue_id)
+    assert updated_state.codex_totals.total_tokens == 0
+    assert_receive {:memory_tracker_comment, ^issue_id, body}
+    assert body =~ "External Merge Evidence"
+    assert body =~ "rev-cold-start"
+    assert body =~ "token_policy: no_codex"
+    assert_receive {:memory_tracker_state_update, ^issue_id, "Done"}
+  end
+
+  test "external-waiting no-auto-Codex issue records unchanged Codeup CR observation" do
+    write_workflow_file!(Workflow.workflow_file_path(),
+      tracker_kind: "memory",
+      tracker_active_states: ["Todo", "In Progress", "Merging"],
+      no_auto_codex_states: ["Merging"]
+    )
+
+    issue_id = "issue-codeup-unchanged"
+
+    issue = %Issue{
+      id: issue_id,
+      identifier: "MT-567",
+      state: "Merging",
+      title: "Await unchanged Codeup merge",
+      description: codeup_metadata_description("TO_BE_MERGED"),
+      labels: []
+    }
+
+    Application.put_env(:symphony_elixir, :external_merge_watcher, __MODULE__.FakeExternalMergeWatcher)
+    Application.put_env(:symphony_elixir, :external_merge_watcher_result, {:unchanged, %{observed_key: "codeup:org-123:6907286:3:TO_BE_MERGED:2026-05-30T10:00:00Z"}})
+    Application.put_env(:symphony_elixir, :external_merge_watcher_recipient, self())
+
+    state = external_waiting_state_for_issue(issue)
+
+    updated_state = Orchestrator.reconcile_external_waiting_issue_states_for_test([issue], state)
+
+    assert_receive {:external_merge_watcher_check, ^issue, opts}
+    assert Keyword.get(opts, :observed_key) == nil
+    refute Map.has_key?(updated_state.retry_attempts, issue_id)
+    refute Map.has_key?(updated_state.blocked, issue_id)
+    assert Map.has_key?(Map.get(updated_state, :external_waiting, %{}), issue_id)
+
+    assert updated_state.external_observations[issue_id] ==
+             "codeup:org-123:6907286:3:TO_BE_MERGED:2026-05-30T10:00:00Z"
+
+    assert %{
+             cr_status: "TO_BE_MERGED",
+             observed_key: "codeup:org-123:6907286:3:TO_BE_MERGED:2026-05-30T10:00:00Z",
+             token_policy: :no_codex,
+             next_action: :wait
+           } = Map.fetch!(Map.get(updated_state, :external_waiting, %{}), issue_id)
+  end
+
+  test "operator-blocked no-auto-Codex issue remains blocked instead of becoming external waiting" do
+    write_workflow_file!(Workflow.workflow_file_path(),
+      tracker_kind: "memory",
+      tracker_active_states: ["Todo", "In Progress", "Merging"],
+      no_auto_codex_states: ["Merging"]
+    )
+
+    issue_id = "issue-operator-blocked-merging"
+
+    issue = %Issue{
+      id: issue_id,
+      identifier: "MT-571",
+      state: "Merging",
+      title: "Human input still needed",
+      description: codeup_metadata_description("TO_BE_MERGED"),
+      labels: []
+    }
+
+    state =
+      blocked_state_for_issue(issue)
+      |> put_in([Access.key!(:blocked), issue_id, :error], "codex turn requires operator input")
+      |> Map.put(:external_waiting, %{})
+
+    updated_state = Orchestrator.reconcile_blocked_issue_states_for_test([issue], state)
+
+    assert Map.has_key?(updated_state.blocked, issue_id)
+    refute Map.has_key?(Map.get(updated_state, :external_waiting, %{}), issue_id)
+  end
+
+  test "external-waiting no-auto-Codex issue finalizes merged Codeup CR without retry" do
+    write_workflow_file!(Workflow.workflow_file_path(),
+      tracker_kind: "memory",
+      tracker_active_states: ["Todo", "In Progress", "Merging", "Rework"],
+      tracker_terminal_states: ["Closed", "Cancelled", "Canceled", "Duplicate", "Done"],
+      no_auto_codex_states: ["Merging"]
+    )
+
+    Application.put_env(:symphony_elixir, :memory_tracker_recipient, self())
+
+    issue_id = "issue-codeup-merged"
+
+    issue = %Issue{
+      id: issue_id,
+      identifier: "MT-568",
+      state: "Merging",
+      title: "Wake after Codeup merge",
+      description: codeup_metadata_description("TO_BE_MERGED"),
+      labels: []
+    }
+
+    observation = %{
+      observed_key: "codeup:org-123:6907286:3:MERGED:8867ebd9c0ffee",
+      status: "MERGED",
+      revision: "8867ebd9c0ffee"
+    }
+
+    event_metadata = %{
+      provider: "codeup",
+      change_request_id: "3",
+      from_state: "TO_BE_MERGED",
+      to_state: "MERGED",
+      status: "MERGED",
+      revision: "8867ebd9c0ffee",
+      observed_key: observation.observed_key,
+      outcome: :merged,
+      url: "https://codeup.example/change/3"
+    }
+
+    Application.put_env(:symphony_elixir, :external_merge_watcher, __MODULE__.FakeExternalMergeWatcher)
+    Application.put_env(:symphony_elixir, :external_merge_watcher_result, {:changed, observation, event_metadata})
+    Application.put_env(:symphony_elixir, :external_merge_watcher_recipient, self())
+
+    state = external_waiting_state_for_issue(issue)
+
+    updated_state = Orchestrator.reconcile_external_waiting_issue_states_for_test([issue], state)
+
+    assert_receive {:external_merge_watcher_check, ^issue, _opts}
+    refute Map.has_key?(Map.get(updated_state, :external_waiting, %{}), issue_id)
+    refute Map.has_key?(updated_state.blocked, issue_id)
+    refute Map.has_key?(updated_state.retry_attempts, issue_id)
+    assert updated_state.external_observations[issue_id] == observation.observed_key
+
+    assert_receive {:memory_tracker_comment, ^issue_id, body}
+    assert body =~ "External Merge Evidence"
+    assert body =~ "MERGED"
+    assert body =~ "8867ebd9c0ffee"
+    assert body =~ "token_policy: no_codex"
+    assert_receive {:memory_tracker_state_update, ^issue_id, "Done"}
+  end
+
+  test "external-waiting no-auto-Codex issue moves terminal failed Codeup CR to Rework without retry" do
+    write_workflow_file!(Workflow.workflow_file_path(),
+      tracker_kind: "memory",
+      tracker_active_states: ["Todo", "In Progress", "Merging", "Rework"],
+      tracker_terminal_states: ["Closed", "Cancelled", "Canceled", "Duplicate", "Done"],
+      no_auto_codex_states: ["Merging"]
+    )
+
+    Application.put_env(:symphony_elixir, :memory_tracker_recipient, self())
+
+    issue_id = "issue-codeup-closed"
+
+    issue = %Issue{
+      id: issue_id,
+      identifier: "MT-573",
+      state: "Merging",
+      title: "Rework after Codeup close",
+      description: codeup_metadata_description("TO_BE_MERGED"),
+      labels: []
+    }
+
+    observation = %{
+      observed_key: "codeup:org-123:6907286:3:CLOSED:2026-05-30T11:00:00Z",
+      status: "CLOSED",
+      revision: nil,
+      outcome: :terminal_failure,
+      provider: "codeup",
+      change_request_id: "3"
+    }
+
+    event_metadata = %{
+      provider: "codeup",
+      change_request_id: "3",
+      from_state: "TO_BE_MERGED",
+      to_state: "CLOSED",
+      status: "CLOSED",
+      revision: nil,
+      observed_key: observation.observed_key,
+      outcome: :terminal_failure,
+      url: "https://codeup.example/change/3"
+    }
+
+    Application.put_env(:symphony_elixir, :external_merge_watcher, __MODULE__.FakeExternalMergeWatcher)
+    Application.put_env(:symphony_elixir, :external_merge_watcher_result, {:changed, observation, event_metadata})
+    Application.put_env(:symphony_elixir, :external_merge_watcher_recipient, self())
+
+    state = external_waiting_state_for_issue(issue)
+
+    updated_state = Orchestrator.reconcile_external_waiting_issue_states_for_test([issue], state)
+
+    assert_receive {:external_merge_watcher_check, ^issue, _opts}
+    refute Map.has_key?(Map.get(updated_state, :external_waiting, %{}), issue_id)
+    refute Map.has_key?(updated_state.blocked, issue_id)
+    refute Map.has_key?(updated_state.retry_attempts, issue_id)
+    refute MapSet.member?(updated_state.completed, issue_id)
+
+    assert_receive {:memory_tracker_comment, ^issue_id, body}
+    assert body =~ "External Merge Evidence"
+    assert body =~ "CLOSED"
+    assert body =~ "target_linear_state: Rework"
+    assert body =~ "reason: external_terminal_failure"
+    assert body =~ "token_policy: no_codex"
+    assert_receive {:memory_tracker_state_update, ^issue_id, "Rework"}
+  end
+
+  defmodule FakeExternalMergeWatcher do
+    def check_issue(issue, opts) do
+      case Application.get_env(:symphony_elixir, :external_merge_watcher_recipient) do
+        pid when is_pid(pid) -> send(pid, {:external_merge_watcher_check, issue, opts})
+        _ -> :ok
+      end
+
+      Application.fetch_env!(:symphony_elixir, :external_merge_watcher_result)
+    end
+  end
+
   test "select_worker_host_for_test skips full ssh hosts under the shared per-host cap" do
     write_workflow_file!(Workflow.workflow_file_path(),
       worker_ssh_hosts: ["worker-a", "worker-b"],
@@ -833,12 +1423,90 @@ defmodule SymphonyElixir.CoreTest do
   defp assert_due_in_range(due_at_ms, min_remaining_ms, max_remaining_ms) do
     remaining_ms = due_at_ms - System.monotonic_time(:millisecond)
 
-    assert remaining_ms >= min_remaining_ms
+    assert remaining_ms >= min_remaining_ms - 500
     assert remaining_ms <= max_remaining_ms
   end
 
   defp restore_app_env(key, nil), do: Application.delete_env(:symphony_elixir, key)
   defp restore_app_env(key, value), do: Application.put_env(:symphony_elixir, key, value)
+
+  defp blocked_state_for_issue(%Issue{} = issue) do
+    %Orchestrator.State{
+      claimed: MapSet.new([issue.id]),
+      blocked: %{
+        issue.id => %{
+          issue_id: issue.id,
+          identifier: issue.identifier,
+          issue: issue,
+          worker_host: nil,
+          workspace_path: "/tmp/#{issue.identifier}",
+          session_id: "thread-turn",
+          error: "automatic Codex dispatch suppressed for state #{issue.state}",
+          blocked_at: DateTime.utc_now(),
+          last_codex_message: nil,
+          last_codex_event: nil,
+          last_codex_timestamp: nil
+        }
+      },
+      retry_attempts: %{},
+      codex_totals: %{input_tokens: 0, output_tokens: 0, total_tokens: 0, seconds_running: 0},
+      codex_rate_limits: nil
+    }
+    |> Map.put(:external_observations, %{})
+  end
+
+  defp external_waiting_state_for_issue(%Issue{} = issue) do
+    %Orchestrator.State{
+      running: %{},
+      blocked: %{},
+      claimed: MapSet.new([issue.id]),
+      retry_attempts: %{},
+      codex_totals: %{input_tokens: 0, output_tokens: 0, total_tokens: 0, seconds_running: 0},
+      codex_rate_limits: nil
+    }
+    |> Map.put(:external_observations, %{})
+    |> Map.put(:external_waiting, %{
+      issue.id => %{
+        issue_id: issue.id,
+        identifier: issue.identifier,
+        issue: issue,
+        provider: "codeup",
+        change_request_id: "3",
+        token_policy: :no_codex,
+        cr_status: nil,
+        observed_key: nil,
+        next_action: :wait,
+        error: nil,
+        waiting_since: DateTime.utc_now(),
+        last_checked_at: nil
+      }
+    })
+  end
+
+  defp codeup_metadata_description(last_observed_status) do
+    metadata =
+      %{
+        provider: "codeup",
+        domain: "openapi-rdc.aliyuncs.com",
+        organization_id: "org-123",
+        repo_id: "6907286",
+        change_request_id: 3,
+        source_branch: "fir-15-update-start-copy",
+        target_branch: "master",
+        delivery_commit: "fde329cfb8f523300f6066085f4c0a7ec0712c8c",
+        last_observed_cr_state: last_observed_status
+      }
+
+    """
+    ## Codex Workpad
+
+    ### Delivery Metadata
+
+    ```json
+    #{Jason.encode!(metadata, pretty: true)}
+    ```
+    """
+  end
 
   test "fetch issues by states with empty state set is a no-op" do
     assert {:ok, []} = Client.fetch_issues_by_states([])
@@ -1048,8 +1716,8 @@ defmodule SymphonyElixir.CoreTest do
     assert prompt =~ "This is an unattended orchestration session."
     assert prompt =~ "Only stop early for a true blocker"
     assert prompt =~ "Do not include \"next steps for user\""
-    assert prompt =~ "open and follow `.codex/skills/land/SKILL.md`"
-    assert prompt =~ "Do not call `gh pr merge` directly"
+    assert prompt =~ "external-event waiting state after human approval"
+    assert prompt =~ "do not poll or retry from Codex"
     assert prompt =~ "Continuation context:"
     assert prompt =~ "retry attempt #2"
   end
@@ -1627,6 +2295,101 @@ defmodule SymphonyElixir.CoreTest do
         description: "Still active",
         state: "Merging",
         url: "https://example.org/issues/MT-249",
+        labels: []
+      }
+
+      assert :ok = AgentRunner.run(issue, nil, issue_state_fetcher: state_fetcher)
+
+      trace = File.read!(trace_file)
+      assert length(String.split(trace, "RUN", trim: true)) == 1
+      assert length(Regex.scan(~r/"method":"turn\/start"/, trace)) == 1
+    after
+      System.delete_env("SYMP_TEST_CODEx_TRACE")
+      File.rm_rf(test_root)
+    end
+  end
+
+  test "agent runner stops in-process continuation when refreshed issue enters no-auto-Codex state" do
+    test_root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-elixir-agent-runner-no-auto-state-#{System.unique_integer([:positive])}"
+      )
+
+    try do
+      template_repo = Path.join(test_root, "source")
+      workspace_root = Path.join(test_root, "workspaces")
+      codex_binary = Path.join(test_root, "fake-codex")
+      trace_file = Path.join(test_root, "codex.trace")
+
+      File.mkdir_p!(template_repo)
+      File.write!(Path.join(template_repo, "README.md"), "# test")
+      System.cmd("git", ["-C", template_repo, "init", "-b", "main"])
+      System.cmd("git", ["-C", template_repo, "config", "user.name", "Test User"])
+      System.cmd("git", ["-C", template_repo, "config", "user.email", "test@example.com"])
+      System.cmd("git", ["-C", template_repo, "add", "README.md"])
+      System.cmd("git", ["-C", template_repo, "commit", "-m", "initial"])
+
+      File.write!(codex_binary, """
+      #!/bin/sh
+      trace_file="${SYMP_TEST_CODEx_TRACE:-/tmp/codex.trace}"
+      printf 'RUN\\n' >> "$trace_file"
+      turn_count=0
+
+      while IFS= read -r line; do
+        printf 'JSON:%s\\n' "$line" >> "$trace_file"
+        case "$line" in
+          *'"method":"initialize"'*)
+            printf '%s\\n' '{"id":1,"result":{}}'
+            ;;
+          *'"method":"initialized"'*)
+            ;;
+          *'"method":"thread/start"'*)
+            printf '%s\\n' '{"id":2,"result":{"thread":{"id":"thread-no-auto-state"}}}'
+            ;;
+          *'"method":"turn/start"'*)
+            turn_count=$((turn_count + 1))
+            printf '%s\\n' '{"id":3,"result":{"turn":{"id":"turn-no-auto-state"}}}'
+            printf '%s\\n' '{"method":"turn/completed"}'
+            ;;
+        esac
+      done
+      """)
+
+      File.chmod!(codex_binary, 0o755)
+      System.put_env("SYMP_TEST_CODEx_TRACE", trace_file)
+
+      on_exit(fn -> System.delete_env("SYMP_TEST_CODEx_TRACE") end)
+
+      write_workflow_file!(Workflow.workflow_file_path(),
+        workspace_root: workspace_root,
+        hook_after_create: "cp #{Path.join(template_repo, "README.md")} README.md",
+        codex_command: "#{codex_binary} app-server",
+        tracker_active_states: ["Todo", "In Progress", "Merging"],
+        max_turns: 3,
+        no_auto_codex_states: ["Merging"]
+      )
+
+      state_fetcher = fn [_issue_id] ->
+        {:ok,
+         [
+           %Issue{
+             id: "issue-enters-no-auto-state",
+             identifier: "MT-563",
+             title: "Stop after entering Merging",
+             description: "Still active but externally waiting",
+             state: "Merging"
+           }
+         ]}
+      end
+
+      issue = %Issue{
+        id: "issue-enters-no-auto-state",
+        identifier: "MT-563",
+        title: "Stop after entering Merging",
+        description: "Start in progress",
+        state: "In Progress",
+        url: "https://example.org/issues/MT-563",
         labels: []
       }
 

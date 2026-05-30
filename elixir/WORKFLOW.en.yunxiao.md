@@ -43,6 +43,8 @@ agent:
     Merging: 1
   no_continuation_retry_states:
     - Merging
+  no_auto_codex_states:
+    - Merging
 codex:
   command: codex --config shell_environment_policy.inherit=all --config 'model="gpt-5.5"' --config model_reasoning_effort=xhigh app-server
   approval_policy: never
@@ -128,7 +130,7 @@ The MCP server must be configured with a Yunxiao personal access token that has 
 - `Todo` -> Waiting to start. Move to `In Progress` as soon as you take it.
 - `In Progress` -> Planning, implementation, and validation are actively underway.
 - `In Review` -> The delivery Yunxiao / Codeup change request is ready for a human to review. Do not make code changes in this state.
-- `Merging` -> Human review approved the delivery. Finish the merge/acceptance handling, verify the result, then move to `Done`.
+- `Merging` -> External-event waiting state after human review approval. Codex must not poll or retry here. Symphony tracks the Codeup change request through API polling and finalizes to `Done` or `Rework` without starting Codex. Human explicit resume is still allowed for manual intervention.
 - `Rework` -> Human review requested changes. Re-enter plan / implement / validate flow.
 - `Done` -> Terminal state after merge/acceptance handling is complete.
 
@@ -147,7 +149,7 @@ Required Linear team states:
    - `Todo` -> Immediately move it to `In Progress`, initialize the workpad, then begin execution.
    - `In Progress` -> Continue from the current branch and current workpad.
    - `In Review` -> Do not change code. Wait for a human to review the linked Yunxiao / Codeup change request, workpad, validation result, and delivery summary.
-   - `Merging` -> Finish the merge/acceptance handling, verify the result, then move the issue to `Done`.
+   - `Merging` -> Do not poll or retry from Codex. Symphony's external watcher handles Codeup polling and closeout without Codex. Only act if a human explicitly resumes the issue.
    - `Rework` -> Return to the re-plan, modify, and re-validate loop.
    - `Done` -> Do nothing and exit.
 4. Check whether the current issue is already associated with an active delivery branch or Yunxiao change request.
@@ -214,6 +216,7 @@ Required Linear team states:
    - branch name
    - change request URL
    - change request ID / number when available
+   - structured delivery metadata as JSON under `### Delivery Metadata`, including `provider`, `organization_id`, `repo_id` or `repository_id`, `change_request_id`, `source_branch`, `target_branch`, `delivery_commit`, and `last_observed_cr_state`
    - latest commit SHA
    - key change summary
    - local validation result
@@ -232,14 +235,10 @@ When the issue enters `In Review`:
 
 When the issue enters `Merging`:
 
-1. Re-read the linked Yunxiao / Codeup change request and the workpad.
-2. Confirm the latest delivery commit and required validation are still current.
-3. Merge or otherwise accept the change request using the available Yunxiao / Codeup capability.
-   - If the MCP server exposes merge/accept capability, use it and record the result.
-   - If the change request has already been merged by a human, verify that status with `get_change_request` and record the result.
-   - If merge/accept capability is unavailable and the change request is not already merged, record a blocker in the workpad and keep the issue in `Merging`.
-4. Record the merge/acceptance result in the workpad.
-5. Move the issue to `Done` only after merge/acceptance handling is complete.
+1. Treat `Merging` as an external-event waiting state, not as active Codex work.
+2. Do not start Codex just to check whether Codeup has merged. The Symphony external merge watcher polls Codeup without Codex and records closeout evidence directly.
+3. The watcher moves the issue to `Done` when Codeup reports a successful merge.
+4. If Codeup reports a closed, failed, canceled, or otherwise unsuccessful terminal state, the watcher records the evidence and moves the issue to `Rework` or surfaces the error for human handling.
 
 ## Step 4: Rework
 

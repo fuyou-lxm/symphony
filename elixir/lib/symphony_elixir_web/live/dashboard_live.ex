@@ -98,6 +98,12 @@ defmodule SymphonyElixirWeb.DashboardLive do
           </article>
 
           <article class="metric-card">
+            <p class="metric-label">External waiting</p>
+            <p class="metric-value numeric"><%= @payload.counts.external_waiting %></p>
+            <p class="metric-detail">No-Codex issues watched through external APIs.</p>
+          </article>
+
+          <article class="metric-card">
             <p class="metric-label">Total tokens</p>
             <p class="metric-value numeric"><%= format_int(@payload.codex_totals.total_tokens) %></p>
             <p class="metric-detail numeric">
@@ -203,6 +209,87 @@ defmodule SymphonyElixirWeb.DashboardLive do
                       <div class="token-stack numeric">
                         <span>Total: <%= format_int(entry.tokens.total_tokens) %></span>
                         <span class="muted">In <%= format_int(entry.tokens.input_tokens) %> / Out <%= format_int(entry.tokens.output_tokens) %></span>
+                      </div>
+                    </td>
+                  </tr>
+                </tbody>
+              </table>
+            </div>
+          <% end %>
+        </section>
+
+        <section class="section-card">
+          <div class="section-header">
+            <div>
+              <h2 class="section-title">External waiting</h2>
+              <p class="section-copy">Merging issues monitored through Linear and Codeup without starting Codex.</p>
+            </div>
+          </div>
+
+          <%= if @payload.external_waiting == [] do %>
+            <p class="empty-state">No external waits.</p>
+          <% else %>
+            <div class="table-wrap">
+              <table class="data-table data-table-external">
+                <colgroup>
+                  <col style="width: 11rem;" />
+                  <col style="width: 8rem;" />
+                  <col style="width: 11rem;" />
+                  <col style="width: 9rem;" />
+                  <col style="width: 8rem;" />
+                  <col style="width: 13rem;" />
+                  <col />
+                </colgroup>
+                <thead>
+                  <tr>
+                    <th>Issue</th>
+                    <th>Linear state</th>
+                    <th>Codeup CR</th>
+                    <th>CR status</th>
+                    <th>Token policy</th>
+                    <th>Last checked</th>
+                    <th>Next action</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  <tr :for={entry <- @payload.external_waiting}>
+                    <td>
+                      <div class="issue-stack">
+                        <span class="issue-id"><%= entry.issue_identifier %></span>
+                        <a class="issue-link" href={"/api/v1/#{entry.issue_identifier}"}>JSON details</a>
+                      </div>
+                    </td>
+                    <td>
+                      <span class={state_badge_class(entry.linear_state || "External waiting")}>
+                        <%= entry.linear_state || "External waiting" %>
+                      </span>
+                    </td>
+                    <td>
+                      <div class="detail-stack">
+                        <span class="mono"><%= format_provider_cr(entry.provider, entry.change_request) %></span>
+                        <%= if entry.url do %>
+                          <a class="issue-link" href={entry.url}>Open CR</a>
+                        <% end %>
+                      </div>
+                    </td>
+                    <td>
+                      <div class="detail-stack">
+                        <span class={state_badge_class(entry.cr_status || "pending")}>
+                          <%= entry.cr_status || "pending" %>
+                        </span>
+                        <span class="muted mono event-meta" title={entry.observed_key || "n/a"}>
+                          <%= entry.observed_key || "n/a" %>
+                        </span>
+                      </div>
+                    </td>
+                    <td class="mono"><%= entry.token_policy || "n/a" %></td>
+                    <td class="mono numeric"><%= entry.last_checked_at || "n/a" %></td>
+                    <td>
+                      <div class="detail-stack">
+                        <span><%= entry.next_action || "n/a" %></span>
+                        <%= if entry.error do %>
+                          <span class="error-inline" title={entry.error}><%= entry.error %></span>
+                        <% end %>
                       </div>
                     </td>
                   </tr>
@@ -394,11 +481,19 @@ defmodule SymphonyElixirWeb.DashboardLive do
     normalized = state |> to_string() |> String.downcase()
 
     cond do
+      String.contains?(normalized, ["merged", "done"]) -> "#{base} state-badge-active"
+      String.contains?(normalized, ["merging", "waiting", "external"]) -> "#{base} state-badge-info"
       String.contains?(normalized, ["progress", "running", "active"]) -> "#{base} state-badge-active"
       String.contains?(normalized, ["blocked", "error", "failed"]) -> "#{base} state-badge-danger"
       String.contains?(normalized, ["todo", "queued", "pending", "retry"]) -> "#{base} state-badge-warning"
       true -> base
     end
+  end
+
+  defp format_provider_cr(provider, change_request) do
+    provider = provider || "external"
+    change_request = change_request || "unknown"
+    "#{provider} ##{change_request}"
   end
 
   defp schedule_runtime_tick do

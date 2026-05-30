@@ -7,7 +7,7 @@ defmodule SymphonyElixir.Orchestrator do
   require Logger
   import Bitwise, only: [<<<: 2]
 
-  alias SymphonyElixir.{AgentRunner, Config, StatusDashboard, Tracker, Workspace}
+  alias SymphonyElixir.{AgentRunner, Config, ExternalMergeWatcher, StatusDashboard, Tracker, Workspace}
   alias SymphonyElixir.Linear.Issue
 
   @continuation_retry_delay_ms 1_000
@@ -37,6 +37,8 @@ defmodule SymphonyElixir.Orchestrator do
       completed: MapSet.new(),
       claimed: MapSet.new(),
       blocked: %{},
+      external_waiting: %{},
+      external_observations: %{},
       retry_attempts: %{},
       codex_totals: nil,
       codex_rate_limits: nil
@@ -235,12 +237,20 @@ defmodule SymphonyElixir.Orchestrator do
 
     next_attempt = next_retry_attempt_from_running(running_entry)
 
-    schedule_issue_retry(state, issue_id, next_attempt, %{
-      identifier: running_entry.identifier,
-      error: "agent exited: #{inspect(reason)}",
-      worker_host: Map.get(running_entry, :worker_host),
-      workspace_path: Map.get(running_entry, :workspace_path)
-    })
+    if no_auto_codex?(Map.get(running_entry, :issue)) do
+      Logger.info(
+        "Agent task exited for issue_id=#{issue_id} issue_identifier=#{running_entry.identifier} session_id=#{session_id}, but automatic Codex dispatch is suppressed for state=#{running_entry.issue.state}; blocking until external state changes"
+      )
+
+      block_issue_from_entry(state, issue_id, running_entry, "automatic Codex dispatch suppressed for state #{running_entry.issue.state}")
+    else
+      schedule_issue_retry(state, issue_id, next_attempt, %{
+        identifier: running_entry.identifier,
+        error: "agent exited: #{inspect(reason)}",
+        worker_host: Map.get(running_entry, :worker_host),
+        workspace_path: Map.get(running_entry, :workspace_path)
+      })
+    end
   end
 
   defp maybe_dispatch(%State{} = state) do
@@ -248,11 +258,17 @@ defmodule SymphonyElixir.Orchestrator do
       state
       |> reconcile_running_issues()
       |> reconcile_blocked_issues()
+      |> reconcile_external_waiting_issues()
 
     with :ok <- Config.validate!(),
-         {:ok, issues} <- Tracker.fetch_candidate_issues(),
-         true <- available_slots(state) > 0 do
-      choose_issues(issues, state)
+         {:ok, issues} <- Tracker.fetch_candidate_issues() do
+      state = track_external_waiting_candidates(issues, state)
+
+      if available_slots(state) > 0 do
+        choose_issues(issues, state)
+      else
+        state
+      end
     else
       {:error, :missing_linear_api_token} ->
         Logger.error("Linear API token missing in WORKFLOW.md")
@@ -290,9 +306,6 @@ defmodule SymphonyElixir.Orchestrator do
 
       {:error, reason} ->
         Logger.error("Failed to fetch from Linear: #{inspect(reason)}")
-        state
-
-      false ->
         state
     end
   end
@@ -346,6 +359,30 @@ defmodule SymphonyElixir.Orchestrator do
     end
   end
 
+  defp reconcile_external_waiting_issues(%State{} = state) do
+    external_waiting_ids = Map.keys(state.external_waiting)
+
+    if external_waiting_ids == [] do
+      state
+    else
+      case Tracker.fetch_issue_states_by_ids(external_waiting_ids) do
+        {:ok, issues} ->
+          issues
+          |> reconcile_external_waiting_issue_states(
+            state,
+            active_state_set(),
+            terminal_state_set()
+          )
+          |> reconcile_missing_external_waiting_issue_ids(external_waiting_ids, issues)
+
+        {:error, reason} ->
+          Logger.debug("Failed to refresh external-waiting issue states: #{inspect(reason)}; keeping external waits")
+
+          state
+      end
+    end
+  end
+
   @doc false
   @spec reconcile_issue_states_for_test([Issue.t()], term()) :: term()
   def reconcile_issue_states_for_test(issues, %State{} = state) when is_list(issues) do
@@ -354,6 +391,18 @@ defmodule SymphonyElixir.Orchestrator do
 
   def reconcile_issue_states_for_test(issues, state) when is_list(issues) do
     reconcile_running_issue_states(issues, state, active_state_set(), terminal_state_set())
+  end
+
+  @doc false
+  @spec reconcile_blocked_issue_states_for_test([Issue.t()], term()) :: term()
+  def reconcile_blocked_issue_states_for_test(issues, %State{} = state) when is_list(issues) do
+    reconcile_blocked_issue_states(issues, state, active_state_set(), terminal_state_set())
+  end
+
+  @doc false
+  @spec reconcile_external_waiting_issue_states_for_test([Issue.t()], term()) :: term()
+  def reconcile_external_waiting_issue_states_for_test(issues, %State{} = state) when is_list(issues) do
+    reconcile_external_waiting_issue_states(issues, state, active_state_set(), terminal_state_set())
   end
 
   @doc false
@@ -368,6 +417,23 @@ defmodule SymphonyElixir.Orchestrator do
   def revalidate_issue_for_dispatch_for_test(%Issue{} = issue, issue_fetcher)
       when is_function(issue_fetcher, 1) do
     revalidate_issue_for_dispatch(issue, issue_fetcher, terminal_state_set())
+  end
+
+  @doc false
+  @spec handle_retry_issue_lookup_for_test(Issue.t() | nil, State.t(), String.t(), pos_integer(), map()) ::
+          term()
+  def handle_retry_issue_lookup_for_test(issue_or_nil, %State{} = state, issue_id, attempt, metadata)
+      when is_binary(issue_id) and is_integer(attempt) and is_map(metadata) do
+    handle_retry_issue_lookup_result(
+      issue_or_nil,
+      state,
+      issue_id,
+      attempt,
+      metadata,
+      fn state, issue, attempt, metadata ->
+        {:dispatch, state, issue, attempt, metadata}
+      end
+    )
   end
 
   @doc false
@@ -439,6 +505,14 @@ defmodule SymphonyElixir.Orchestrator do
         Logger.info("Blocked issue no longer routed to this worker: #{issue_context(issue)} assignee=#{inspect(issue.assignee_id)}; releasing block")
         release_issue_claim(state, issue.id)
 
+      active_issue_state?(issue.state, active_states) and no_auto_codex?(issue) and
+          external_waiting_blocked_entry?(state, issue.id) ->
+        Logger.info("Moving blocked no-auto-Codex issue into external waiting: #{issue_context(issue)} state=#{issue.state}")
+
+        state
+        |> move_blocked_issue_to_external_waiting(issue)
+        |> watch_external_waiting_merge(issue)
+
       active_issue_state?(issue.state, active_states) ->
         refresh_blocked_issue_state(state, issue)
 
@@ -449,6 +523,40 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   defp reconcile_blocked_issue_state(_issue, state, _active_states, _terminal_states), do: state
+
+  defp reconcile_external_waiting_issue_states([], state, _active_states, _terminal_states), do: state
+
+  defp reconcile_external_waiting_issue_states([issue | rest], state, active_states, terminal_states) do
+    reconcile_external_waiting_issue_states(
+      rest,
+      reconcile_external_waiting_issue_state(issue, state, active_states, terminal_states),
+      active_states,
+      terminal_states
+    )
+  end
+
+  defp reconcile_external_waiting_issue_state(%Issue{} = issue, state, active_states, terminal_states) do
+    cond do
+      terminal_issue_state?(issue.state, terminal_states) ->
+        Logger.info("External-waiting issue moved to terminal state: #{issue_context(issue)} state=#{issue.state}; releasing external wait")
+        release_external_waiting_issue(state, issue.id)
+
+      !issue_routable_to_worker?(issue) ->
+        Logger.info("External-waiting issue no longer routed to this worker: #{issue_context(issue)} assignee=#{inspect(issue.assignee_id)}; releasing external wait")
+        release_external_waiting_issue(state, issue.id)
+
+      active_issue_state?(issue.state, active_states) and no_auto_codex?(issue) ->
+        state
+        |> refresh_external_waiting_issue_state(issue)
+        |> watch_external_waiting_merge(issue)
+
+      true ->
+        Logger.info("External-waiting issue left no-auto active state: #{issue_context(issue)} state=#{issue.state}; releasing external wait")
+        release_external_waiting_issue(state, issue.id)
+    end
+  end
+
+  defp reconcile_external_waiting_issue_state(_issue, state, _active_states, _terminal_states), do: state
 
   defp reconcile_missing_running_issue_ids(%State{} = state, requested_issue_ids, issues)
        when is_list(requested_issue_ids) and is_list(issues) do
@@ -494,6 +602,28 @@ defmodule SymphonyElixir.Orchestrator do
 
   defp reconcile_missing_blocked_issue_ids(state, _requested_issue_ids, _issues), do: state
 
+  defp reconcile_missing_external_waiting_issue_ids(%State{} = state, requested_issue_ids, issues)
+       when is_list(requested_issue_ids) and is_list(issues) do
+    visible_issue_ids =
+      issues
+      |> Enum.flat_map(fn
+        %Issue{id: issue_id} when is_binary(issue_id) -> [issue_id]
+        _ -> []
+      end)
+      |> MapSet.new()
+
+    Enum.reduce(requested_issue_ids, state, fn issue_id, state_acc ->
+      if MapSet.member?(visible_issue_ids, issue_id) do
+        state_acc
+      else
+        Logger.info("External-waiting issue no longer visible during state refresh: issue_id=#{issue_id}; releasing external wait")
+        release_external_waiting_issue(state_acc, issue_id)
+      end
+    end)
+  end
+
+  defp reconcile_missing_external_waiting_issue_ids(state, _requested_issue_ids, _issues), do: state
+
   defp log_missing_running_issue(%State{} = state, issue_id) when is_binary(issue_id) do
     case Map.get(state.running, issue_id) do
       %{identifier: identifier} ->
@@ -526,6 +656,247 @@ defmodule SymphonyElixir.Orchestrator do
     end
   end
 
+  defp refresh_external_waiting_issue_state(%State{} = state, %Issue{} = issue) do
+    case Map.get(state.external_waiting, issue.id) do
+      %{issue: _} = waiting_entry ->
+        %{state | external_waiting: Map.put(state.external_waiting, issue.id, %{waiting_entry | issue: issue})}
+
+      _ ->
+        state
+    end
+  end
+
+  defp external_waiting_blocked_entry?(%State{} = state, issue_id) do
+    state.blocked
+    |> Map.get(issue_id)
+    |> external_waiting_blocked_entry?()
+  end
+
+  defp external_waiting_blocked_entry?(%{error: error}) when is_binary(error) do
+    normalized = String.downcase(error)
+
+    String.contains?(normalized, "automatic codex dispatch suppressed") or
+      String.contains?(normalized, "continuation retry suppressed")
+  end
+
+  defp external_waiting_blocked_entry?(_entry), do: false
+
+  defp put_external_observation(%State{} = state, issue_id, observed_key)
+       when is_binary(issue_id) and is_binary(observed_key) do
+    %{state | external_observations: Map.put(state.external_observations, issue_id, observed_key)}
+  end
+
+  defp put_external_observation(%State{} = state, _issue_id, _observed_key), do: state
+
+  defp update_external_waiting_observation(%State{} = state, issue_id, observation, next_action)
+       when is_binary(issue_id) and is_map(observation) do
+    update_external_waiting_entry(state, issue_id, fn entry ->
+      observed_key = Map.get(observation, :observed_key) || Map.get(entry, :observed_key)
+
+      Map.merge(entry, %{
+        provider: Map.get(observation, :provider) || Map.get(entry, :provider),
+        change_request_id: Map.get(observation, :change_request_id) || Map.get(entry, :change_request_id),
+        cr_status: Map.get(observation, :status) || status_from_observed_key(observed_key) || Map.get(entry, :cr_status),
+        revision: Map.get(observation, :revision) || Map.get(entry, :revision),
+        observed_key: observed_key,
+        next_action: next_action,
+        error: nil,
+        last_checked_at: DateTime.utc_now(),
+        url: Map.get(observation, :url) || Map.get(entry, :url)
+      })
+    end)
+  end
+
+  defp update_external_waiting_observation(%State{} = state, _issue_id, _observation, _next_action), do: state
+
+  defp mark_external_waiting_error(%State{} = state, issue_id, reason) when is_binary(issue_id) do
+    update_external_waiting_entry(state, issue_id, fn entry ->
+      Map.merge(entry, %{
+        error: inspect(reason),
+        next_action: :needs_human,
+        last_checked_at: DateTime.utc_now()
+      })
+    end)
+  end
+
+  defp update_external_waiting_entry(%State{} = state, issue_id, fun)
+       when is_binary(issue_id) and is_function(fun, 1) do
+    case Map.get(state.external_waiting, issue_id) do
+      %{} = entry ->
+        %{state | external_waiting: Map.put(state.external_waiting, issue_id, fun.(entry))}
+
+      _ ->
+        state
+    end
+  end
+
+  defp watch_external_waiting_merge(%State{} = state, %Issue{} = issue) do
+    watcher = external_merge_watcher_module()
+    observed_key = Map.get(state.external_observations, issue.id)
+
+    case watcher.check_issue(issue, observed_key: observed_key, fetch_tracker_comments: true) do
+      {:changed, %{observed_key: new_observed_key} = observation, event_metadata} ->
+        Logger.info("External merge state changed for #{issue_context(issue)} observed_key=#{new_observed_key}; finalizing without Codex")
+
+        state
+        |> put_external_observation(issue.id, new_observed_key)
+        |> update_external_waiting_observation(issue.id, observation, :finalize)
+        |> finalize_external_waiting_issue(issue.id, event_metadata)
+
+      {:unchanged, %{observed_key: new_observed_key} = observation} ->
+        if terminal_external_observation?(observation) do
+          Logger.info("External merge state is terminal for #{issue_context(issue)} observed_key=#{new_observed_key}; finalizing without Codex")
+
+          state
+          |> put_external_observation(issue.id, new_observed_key)
+          |> update_external_waiting_observation(issue.id, observation, :finalize)
+          |> finalize_external_waiting_issue(issue.id, external_event_metadata_from_observation(state, issue.id, observation))
+        else
+          Logger.debug("External merge state unchanged for #{issue_context(issue)} observed_key=#{new_observed_key}; keeping external wait")
+
+          state
+          |> put_external_observation(issue.id, new_observed_key)
+          |> update_external_waiting_observation(issue.id, observation, :wait)
+        end
+
+      {:ignored, reason} ->
+        Logger.debug("External merge metadata missing for #{issue_context(issue)} reason=#{inspect(reason)}; keeping external wait visible")
+        mark_external_waiting_error(state, issue.id, reason)
+
+      {:error, reason} ->
+        Logger.warning("External merge watcher failed for #{issue_context(issue)}: #{inspect(reason)}; keeping external wait visible")
+        mark_external_waiting_error(state, issue.id, reason)
+
+      other ->
+        Logger.warning("External merge watcher returned unexpected result for #{issue_context(issue)}: #{inspect(other)}; keeping external wait visible")
+        mark_external_waiting_error(state, issue.id, {:unexpected_external_merge_watch_result, other})
+    end
+  end
+
+  defp finalize_external_waiting_issue(%State{} = state, issue_id, metadata)
+       when is_binary(issue_id) and is_map(metadata) do
+    outcome = Map.get(metadata, :outcome) || Map.get(metadata, "outcome")
+    final_state = external_final_state(outcome)
+
+    finalize_external_waiting_issue(state, issue_id, metadata, final_state)
+  end
+
+  defp finalize_external_waiting_issue(%State{} = state, _issue_id, _metadata), do: state
+
+  defp finalize_external_waiting_issue(%State{} = state, issue_id, metadata, {:ok, target_state, reason}) do
+    case record_external_finalization(issue_id, metadata, target_state, reason) do
+      :ok ->
+        state
+        |> put_external_observation(issue_id, external_metadata_observed_key(metadata))
+        |> release_external_waiting_issue(issue_id)
+        |> record_completed_external_issue(issue_id, target_state)
+
+      {:error, reason} ->
+        mark_external_waiting_error(state, issue_id, reason)
+    end
+  end
+
+  defp finalize_external_waiting_issue(%State{} = state, issue_id, _metadata, :wait) do
+    update_external_waiting_entry(state, issue_id, fn entry ->
+      %{entry | next_action: :wait, last_checked_at: DateTime.utc_now()}
+    end)
+  end
+
+  defp record_completed_external_issue(%State{} = state, issue_id, "Done") do
+    Map.update!(state, :completed, &MapSet.put(&1, issue_id))
+  end
+
+  defp record_completed_external_issue(%State{} = state, issue_id, _target_state) do
+    Map.update!(state, :completed, &MapSet.delete(&1, issue_id))
+  end
+
+  defp external_final_state(outcome) when outcome in [:merged, "merged"], do: {:ok, "Done", :external_merged}
+  defp external_final_state(outcome) when outcome in [:terminal_failure, "terminal_failure"], do: {:ok, "Rework", :external_terminal_failure}
+  defp external_final_state(_outcome), do: :wait
+
+  defp terminal_external_observation?(observation) when is_map(observation) do
+    match?({:ok, _target_state, _reason}, external_final_state(Map.get(observation, :outcome)))
+  end
+
+  defp terminal_external_observation?(_observation), do: false
+
+  defp external_event_metadata_from_observation(%State{} = state, issue_id, observation) do
+    entry = Map.get(state.external_waiting, issue_id, %{})
+
+    %{
+      provider: Map.get(observation, :provider) || Map.get(entry, :provider),
+      change_request_id: Map.get(observation, :change_request_id) || Map.get(entry, :change_request_id),
+      from_state: Map.get(entry, :cr_status) || "unknown",
+      to_state: Map.get(observation, :status) || status_from_observed_key(Map.get(observation, :observed_key)) || "unknown",
+      status: Map.get(observation, :status) || status_from_observed_key(Map.get(observation, :observed_key)),
+      revision: Map.get(observation, :revision),
+      observed_key: Map.get(observation, :observed_key),
+      outcome: Map.get(observation, :outcome),
+      url: Map.get(observation, :url)
+    }
+  end
+
+  defp record_external_finalization(issue_id, metadata, target_state, reason) do
+    case Tracker.create_comment(issue_id, external_finalization_comment(metadata, target_state, reason)) do
+      :ok -> Tracker.update_issue_state(issue_id, target_state)
+      {:error, _reason} = error -> error
+    end
+  end
+
+  defp external_finalization_comment(metadata, target_state, reason) do
+    provider = external_metadata_value(metadata, :provider) || "external"
+    change_request_id = external_metadata_value(metadata, :change_request_id) || "unknown"
+    status = external_metadata_value(metadata, :to_state) || external_metadata_value(metadata, :status) || "unknown"
+    revision = external_metadata_value(metadata, :revision) || "n/a"
+    observed_key = external_metadata_value(metadata, :observed_key) || "n/a"
+    url = external_metadata_value(metadata, :url) || "n/a"
+
+    """
+    ### External Merge Evidence
+
+    provider: #{provider}
+    change_request_id: #{change_request_id}
+    status: #{status}
+    revision: #{revision}
+    observed_key: #{observed_key}
+    url: #{url}
+    target_linear_state: #{target_state}
+    reason: #{reason}
+    token_policy: no_codex
+    recorded_at: #{DateTime.utc_now() |> DateTime.truncate(:second) |> DateTime.to_iso8601()}
+    """
+  end
+
+  defp external_metadata_observed_key(metadata) when is_map(metadata) do
+    external_metadata_value(metadata, :observed_key)
+  end
+
+  defp external_metadata_value(metadata, key) when is_map(metadata) and is_atom(key) do
+    Map.get(metadata, key) || Map.get(metadata, Atom.to_string(key))
+  end
+
+  defp status_from_observed_key(observed_key) when is_binary(observed_key) do
+    case String.split(observed_key, ":", parts: 6) do
+      [_provider, _organization_id, _repository_id, _change_request_id, status, _revision] -> status
+      _ -> nil
+    end
+  end
+
+  defp status_from_observed_key(_observed_key), do: nil
+
+  defp release_external_waiting_issue(%State{} = state, issue_id) do
+    %{
+      state
+      | claimed: MapSet.delete(state.claimed, issue_id),
+        external_waiting: Map.delete(state.external_waiting, issue_id),
+        retry_attempts: Map.delete(state.retry_attempts, issue_id)
+    }
+  end
+
+  defp external_merge_watcher_module do
+    Application.get_env(:symphony_elixir, :external_merge_watcher, ExternalMergeWatcher)
+  end
+
   defp terminate_running_issue(%State{} = state, issue_id, cleanup_workspace) do
     case Map.get(state.running, issue_id) do
       nil ->
@@ -546,6 +917,8 @@ defmodule SymphonyElixir.Orchestrator do
           | running: Map.delete(state.running, issue_id),
             claimed: MapSet.delete(state.claimed, issue_id),
             blocked: Map.delete(state.blocked, issue_id),
+            external_waiting: Map.delete(state.external_waiting, issue_id),
+            external_observations: Map.delete(state.external_observations, issue_id),
             retry_attempts: Map.delete(state.retry_attempts, issue_id)
         }
 
@@ -588,25 +961,38 @@ defmodule SymphonyElixir.Orchestrator do
       identifier = Map.get(running_entry, :identifier, issue_id)
       session_id = running_entry_session_id(running_entry)
 
-      if input_required_blocker?(running_entry) do
-        error = blocker_error(running_entry, "stalled for #{elapsed_ms}ms after Codex requested operator input")
+      cond do
+        input_required_blocker?(running_entry) ->
+          error = blocker_error(running_entry, "stalled for #{elapsed_ms}ms after Codex requested operator input")
 
-        Logger.warning("Issue blocked: issue_id=#{issue_id} issue_identifier=#{identifier} session_id=#{session_id} elapsed_ms=#{elapsed_ms}; #{error}")
+          Logger.warning("Issue blocked: issue_id=#{issue_id} issue_identifier=#{identifier} session_id=#{session_id} elapsed_ms=#{elapsed_ms}; #{error}")
 
-        state
-        |> record_session_completion_totals(running_entry)
-        |> stop_and_block_issue(issue_id, running_entry, error)
-      else
-        Logger.warning("Issue stalled: issue_id=#{issue_id} issue_identifier=#{identifier} session_id=#{session_id} elapsed_ms=#{elapsed_ms}; restarting with backoff")
+          state
+          |> record_session_completion_totals(running_entry)
+          |> stop_and_block_issue(issue_id, running_entry, error)
 
-        next_attempt = next_retry_attempt_from_running(running_entry)
+        no_auto_codex?(Map.get(running_entry, :issue)) ->
+          error = "automatic Codex dispatch suppressed for state #{running_entry.issue.state}"
 
-        state
-        |> terminate_running_issue(issue_id, false)
-        |> schedule_issue_retry(issue_id, next_attempt, %{
-          identifier: identifier,
-          error: "stalled for #{elapsed_ms}ms without codex activity"
-        })
+          Logger.warning(
+            "Issue stalled: issue_id=#{issue_id} issue_identifier=#{identifier} session_id=#{session_id} elapsed_ms=#{elapsed_ms}, but automatic Codex dispatch is suppressed for state=#{running_entry.issue.state}; blocking until external state changes"
+          )
+
+          state
+          |> record_session_completion_totals(running_entry)
+          |> stop_and_block_issue(issue_id, running_entry, error)
+
+        true ->
+          Logger.warning("Issue stalled: issue_id=#{issue_id} issue_identifier=#{identifier} session_id=#{session_id} elapsed_ms=#{elapsed_ms}; restarting with backoff")
+
+          next_attempt = next_retry_attempt_from_running(running_entry)
+
+          state
+          |> terminate_running_issue(issue_id, false)
+          |> schedule_issue_retry(issue_id, next_attempt, %{
+            identifier: identifier,
+            error: "stalled for #{elapsed_ms}ms without codex activity"
+          })
       end
     else
       state
@@ -744,7 +1130,117 @@ defmodule SymphonyElixir.Orchestrator do
       | running: Map.delete(state.running, issue_id),
         retry_attempts: Map.delete(state.retry_attempts, issue_id),
         claimed: MapSet.put(state.claimed, issue_id),
+        external_observations: Map.delete(state.external_observations, issue_id),
         blocked: Map.put(state.blocked, issue_id, blocked_entry)
+    }
+  end
+
+  defp track_external_waiting_candidates(issues, %State{} = state) when is_list(issues) do
+    active_states = active_state_set()
+    terminal_states = terminal_state_set()
+
+    issues
+    |> sort_issues_for_dispatch()
+    |> Enum.reduce(state, fn
+      %Issue{} = issue, state_acc ->
+        if external_waiting_candidate?(issue, state_acc, active_states, terminal_states) do
+          state_acc
+          |> put_external_waiting_issue(issue)
+          |> watch_external_waiting_merge(issue)
+        else
+          state_acc
+        end
+
+      _issue, state_acc ->
+        state_acc
+    end)
+  end
+
+  defp track_external_waiting_candidates(_issues, %State{} = state), do: state
+
+  defp external_waiting_candidate?(
+         %Issue{} = issue,
+         %State{running: running, retry_attempts: retry_attempts, blocked: blocked, external_waiting: external_waiting},
+         active_states,
+         terminal_states
+       ) do
+    base_candidate_issue?(issue, active_states, terminal_states) and
+      no_auto_codex?(issue) and
+      !todo_issue_blocked_by_non_terminal?(issue, terminal_states) and
+      !Map.has_key?(running, issue.id) and
+      !Map.has_key?(retry_attempts, issue.id) and
+      !Map.has_key?(blocked, issue.id) and
+      !Map.has_key?(external_waiting, issue.id)
+  end
+
+  defp external_waiting_candidate?(_issue, _state, _active_states, _terminal_states), do: false
+
+  defp put_external_waiting_issue(%State{} = state, %Issue{} = issue) do
+    Logger.info("Tracking external-waiting no-auto-Codex issue: #{issue_context(issue)} state=#{issue.state}")
+
+    waiting_entry = %{
+      issue_id: issue.id,
+      identifier: issue.identifier || issue.id,
+      issue: issue,
+      provider: nil,
+      change_request_id: nil,
+      cr_status: nil,
+      revision: nil,
+      observed_key: Map.get(state.external_observations, issue.id),
+      token_policy: :no_codex,
+      next_action: :wait,
+      error: nil,
+      waiting_since: DateTime.utc_now(),
+      last_checked_at: nil,
+      last_transition_at: nil,
+      url: nil
+    }
+
+    %{
+      state
+      | claimed: MapSet.put(state.claimed, issue.id),
+        external_waiting: Map.put(state.external_waiting, issue.id, waiting_entry)
+    }
+  end
+
+  defp move_blocked_issue_to_external_waiting(%State{} = state, %Issue{} = issue) do
+    blocked_entry = Map.get(state.blocked, issue.id, %{})
+    existing_entry = Map.get(state.external_waiting, issue.id, %{})
+
+    waiting_entry =
+      Map.merge(
+        %{
+          issue_id: issue.id,
+          identifier: issue.identifier || Map.get(blocked_entry, :identifier) || issue.id,
+          issue: issue,
+          provider: Map.get(existing_entry, :provider),
+          change_request_id: Map.get(existing_entry, :change_request_id),
+          cr_status: Map.get(existing_entry, :cr_status),
+          revision: Map.get(existing_entry, :revision),
+          observed_key: Map.get(state.external_observations, issue.id) || Map.get(existing_entry, :observed_key),
+          token_policy: :no_codex,
+          next_action: :wait,
+          error: nil,
+          waiting_since: Map.get(existing_entry, :waiting_since) || Map.get(blocked_entry, :blocked_at) || DateTime.utc_now(),
+          last_checked_at: Map.get(existing_entry, :last_checked_at),
+          last_transition_at: Map.get(existing_entry, :last_transition_at),
+          url: Map.get(existing_entry, :url)
+        },
+        existing_entry
+      )
+      |> Map.merge(%{
+        issue_id: issue.id,
+        identifier: issue.identifier || Map.get(blocked_entry, :identifier) || issue.id,
+        issue: issue,
+        token_policy: :no_codex,
+        next_action: :wait
+      })
+
+    %{
+      state
+      | blocked: Map.delete(state.blocked, issue.id),
+        claimed: MapSet.put(state.claimed, issue.id),
+        external_waiting: Map.put(state.external_waiting, issue.id, waiting_entry)
     }
   end
 
@@ -789,7 +1285,8 @@ defmodule SymphonyElixir.Orchestrator do
          active_states,
          terminal_states
        ) do
-    candidate_issue?(issue, active_states, terminal_states) and
+    base_candidate_issue?(issue, active_states, terminal_states) and
+      !no_auto_codex?(issue) and
       !todo_issue_blocked_by_non_terminal?(issue, terminal_states) and
       !MapSet.member?(claimed, issue.id) and
       !Map.has_key?(running, issue.id) and
@@ -821,7 +1318,7 @@ defmodule SymphonyElixir.Orchestrator do
     end)
   end
 
-  defp candidate_issue?(
+  defp base_candidate_issue?(
          %Issue{
            id: id,
            identifier: identifier,
@@ -837,7 +1334,7 @@ defmodule SymphonyElixir.Orchestrator do
       !terminal_issue_state?(state_name, terminal_states)
   end
 
-  defp candidate_issue?(_issue, _active_states, _terminal_states), do: false
+  defp base_candidate_issue?(_issue, _active_states, _terminal_states), do: false
 
   defp issue_routable_to_worker?(%Issue{assigned_to_worker: assigned_to_worker})
        when is_boolean(assigned_to_worker),
@@ -1083,6 +1580,18 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   defp handle_retry_issue_lookup(%Issue{} = issue, state, issue_id, attempt, metadata) do
+    handle_retry_issue_lookup_result(issue, state, issue_id, attempt, metadata, fn state, issue, attempt, metadata ->
+      do_handle_active_retry(state, issue, attempt, metadata)
+    end)
+  end
+
+  defp handle_retry_issue_lookup(nil, state, issue_id, attempt, metadata) do
+    handle_retry_issue_lookup_result(nil, state, issue_id, attempt, metadata, fn state, issue, attempt, metadata ->
+      do_handle_active_retry(state, issue, attempt, metadata)
+    end)
+  end
+
+  defp handle_retry_issue_lookup_result(%Issue{} = issue, state, issue_id, attempt, metadata, active_retry_fun) do
     terminal_states = terminal_state_set()
 
     cond do
@@ -1092,13 +1601,18 @@ defmodule SymphonyElixir.Orchestrator do
         cleanup_issue_workspace(issue.identifier, metadata[:worker_host])
         {:noreply, release_issue_claim(state, issue_id)}
 
+      no_auto_codex?(issue) and metadata[:delay_type] != :external ->
+        Logger.info("Issue remains active but automatic Codex dispatch is suppressed: #{issue_context(issue)} state=#{issue.state}; blocking until external state changes")
+
+        {:noreply, block_issue_from_retry(state, issue, metadata, "automatic Codex dispatch suppressed for state #{issue.state}")}
+
       suppress_continuation_retry?(issue, metadata) ->
         Logger.info("Issue remains active but continuation retry is suppressed: #{issue_context(issue)} state=#{issue.state}; blocking until state changes")
 
         {:noreply, block_issue_from_retry(state, issue, metadata, "continuation retry suppressed for state #{issue.state}")}
 
       retry_candidate_issue?(issue, terminal_states) ->
-        handle_active_retry(state, issue, attempt, metadata)
+        active_retry_fun.(state, issue, attempt, metadata)
 
       true ->
         Logger.debug("Issue left active states, removing claim issue_id=#{issue_id} issue_identifier=#{issue.identifier}")
@@ -1107,7 +1621,7 @@ defmodule SymphonyElixir.Orchestrator do
     end
   end
 
-  defp handle_retry_issue_lookup(nil, state, issue_id, _attempt, _metadata) do
+  defp handle_retry_issue_lookup_result(nil, state, issue_id, _attempt, _metadata, _active_retry_fun) do
     Logger.debug("Issue no longer visible, removing claim issue_id=#{issue_id}")
     {:noreply, release_issue_claim(state, issue_id)}
   end
@@ -1147,7 +1661,7 @@ defmodule SymphonyElixir.Orchestrator do
     StatusDashboard.notify_update()
   end
 
-  defp handle_active_retry(state, issue, attempt, metadata) do
+  defp do_handle_active_retry(state, issue, attempt, metadata) do
     if retry_candidate_issue?(issue, terminal_state_set()) and
          dispatch_slots_available?(issue, state) and
          worker_slots_available?(state, metadata[:worker_host]) do
@@ -1167,6 +1681,12 @@ defmodule SymphonyElixir.Orchestrator do
        )}
     end
   end
+
+  defp no_auto_codex?(%Issue{state: state_name}) when is_binary(state_name) do
+    Config.no_auto_codex_for_state?(state_name)
+  end
+
+  defp no_auto_codex?(_issue), do: false
 
   defp suppress_continuation_retry?(%Issue{state: state_name}, %{delay_type: :continuation})
        when is_binary(state_name) do
@@ -1196,6 +1716,8 @@ defmodule SymphonyElixir.Orchestrator do
         retry_attempts: Map.delete(state.retry_attempts, issue.id),
         claimed: MapSet.put(state.claimed, issue.id),
         completed: MapSet.delete(state.completed, issue.id),
+        external_waiting: Map.delete(state.external_waiting, issue.id),
+        external_observations: Map.delete(state.external_observations, issue.id),
         blocked: Map.put(state.blocked, issue.id, blocked_entry)
     }
   end
@@ -1205,8 +1727,46 @@ defmodule SymphonyElixir.Orchestrator do
       state
       | claimed: MapSet.delete(state.claimed, issue_id),
         blocked: Map.delete(state.blocked, issue_id),
+        external_waiting: Map.delete(state.external_waiting, issue_id),
+        external_observations: Map.delete(state.external_observations, issue_id),
         retry_attempts: Map.delete(state.retry_attempts, issue_id)
     }
+  end
+
+  defp wake_blocked_issue_for_manual_resume(%State{} = state, issue_id) do
+    wake_blocked_issue(state, issue_id, %{
+      reason: :manual_resume,
+      error: "manual resume requested"
+    })
+  end
+
+  defp wake_blocked_issue(%State{} = state, issue_id, wakeup) do
+    cond do
+      Map.has_key?(state.running, issue_id) ->
+        {%{queued: false, reason: :already_running}, state}
+
+      Map.has_key?(state.retry_attempts, issue_id) ->
+        {%{queued: false, reason: :already_scheduled}, state}
+
+      true ->
+        case Map.get(state.blocked, issue_id) do
+          %{issue: %Issue{} = issue} = blocked_entry ->
+            state =
+              %{state | blocked: Map.delete(state.blocked, issue_id)}
+              |> schedule_issue_retry(issue_id, 1, %{
+                identifier: Map.get(blocked_entry, :identifier) || issue.identifier,
+                error: Map.fetch!(wakeup, :error),
+                worker_host: Map.get(blocked_entry, :worker_host),
+                workspace_path: Map.get(blocked_entry, :workspace_path),
+                delay_type: :external
+              })
+
+            {%{queued: true, reason: Map.fetch!(wakeup, :reason)}, state}
+
+          _ ->
+            {%{queued: false, reason: :not_blocked}, state}
+        end
+    end
   end
 
   defp retry_delay(attempt, metadata) when is_integer(attempt) and attempt > 0 and is_map(metadata) do
@@ -1364,6 +1924,34 @@ defmodule SymphonyElixir.Orchestrator do
     end
   end
 
+  @spec external_state_changed(String.t(), map()) :: map() | :unavailable
+  def external_state_changed(issue_id, metadata) when is_binary(issue_id) and is_map(metadata) do
+    external_state_changed(__MODULE__, issue_id, metadata)
+  end
+
+  @spec external_state_changed(GenServer.server(), String.t(), map()) :: map() | :unavailable
+  def external_state_changed(server, issue_id, metadata) when is_binary(issue_id) and is_map(metadata) do
+    if Process.whereis(server) do
+      GenServer.call(server, {:external_state_changed, issue_id, metadata})
+    else
+      :unavailable
+    end
+  end
+
+  @spec manual_resume(String.t()) :: map() | :unavailable
+  def manual_resume(issue_id) when is_binary(issue_id) do
+    manual_resume(__MODULE__, issue_id)
+  end
+
+  @spec manual_resume(GenServer.server(), String.t()) :: map() | :unavailable
+  def manual_resume(server, issue_id) when is_binary(issue_id) do
+    if Process.whereis(server) do
+      GenServer.call(server, {:manual_resume, issue_id})
+    else
+      :unavailable
+    end
+  end
+
   @spec snapshot() :: map() | :timeout | :unavailable
   def snapshot, do: snapshot(__MODULE__, 15_000)
 
@@ -1442,11 +2030,33 @@ defmodule SymphonyElixir.Orchestrator do
         }
       end)
 
+    external_waiting =
+      state.external_waiting
+      |> Enum.map(fn {issue_id, metadata} ->
+        %{
+          issue_id: issue_id,
+          identifier: Map.get(metadata, :identifier),
+          state: external_waiting_issue_state(metadata),
+          provider: Map.get(metadata, :provider),
+          change_request_id: Map.get(metadata, :change_request_id),
+          cr_status: Map.get(metadata, :cr_status),
+          revision: Map.get(metadata, :revision),
+          observed_key: Map.get(metadata, :observed_key),
+          token_policy: Map.get(metadata, :token_policy),
+          next_action: Map.get(metadata, :next_action),
+          error: Map.get(metadata, :error),
+          waiting_since: Map.get(metadata, :waiting_since),
+          last_checked_at: Map.get(metadata, :last_checked_at),
+          url: Map.get(metadata, :url)
+        }
+      end)
+
     {:reply,
      %{
        running: running,
        retrying: retrying,
        blocked: blocked,
+       external_waiting: external_waiting,
        codex_totals: state.codex_totals,
        rate_limits: Map.get(state, :codex_rate_limits),
        polling: %{
@@ -1472,8 +2082,63 @@ defmodule SymphonyElixir.Orchestrator do
      }, state}
   end
 
+  def handle_call({:external_state_changed, issue_id, metadata}, _from, state)
+      when is_binary(issue_id) and is_map(metadata) do
+    {reply, state} = handle_external_state_changed(state, issue_id, metadata)
+    {:reply, reply, state}
+  end
+
+  def handle_call({:manual_resume, issue_id}, _from, state) when is_binary(issue_id) do
+    {reply, state} = wake_blocked_issue_for_manual_resume(state, issue_id)
+    {:reply, reply, state}
+  end
+
   defp blocked_issue_state(%{issue: %Issue{state: state}}), do: state
   defp blocked_issue_state(_metadata), do: nil
+
+  defp external_waiting_issue_state(%{issue: %Issue{state: state}}), do: state
+  defp external_waiting_issue_state(_metadata), do: nil
+
+  defp handle_external_state_changed(%State{} = state, issue_id, metadata) do
+    cond do
+      Map.has_key?(state.running, issue_id) ->
+        {%{queued: false, finalized: false, reason: :already_running}, state}
+
+      Map.has_key?(state.retry_attempts, issue_id) ->
+        {%{queued: false, finalized: false, reason: :already_scheduled}, state}
+
+      Map.has_key?(state.external_waiting, issue_id) ->
+        handle_external_waiting_state_changed(state, issue_id, metadata)
+
+      true ->
+        {%{queued: false, finalized: false, reason: :not_external_waiting}, state}
+    end
+  end
+
+  defp handle_external_waiting_state_changed(%State{} = state, issue_id, metadata) do
+    outcome = Map.get(metadata, :outcome) || Map.get(metadata, "outcome")
+
+    case external_final_state(outcome) do
+      {:ok, _target_state, reason} ->
+        finalize_external_state_changed(state, issue_id, metadata, reason)
+
+      :wait ->
+        {%{queued: false, finalized: false, reason: :external_state_not_terminal},
+         update_external_waiting_entry(state, issue_id, fn entry ->
+           %{entry | next_action: :wait, last_checked_at: DateTime.utc_now()}
+         end)}
+    end
+  end
+
+  defp finalize_external_state_changed(%State{} = state, issue_id, metadata, reason) do
+    updated_state = finalize_external_waiting_issue(state, issue_id, metadata)
+
+    if Map.has_key?(updated_state.external_waiting, issue_id) do
+      {%{queued: false, finalized: false, reason: :finalize_failed}, updated_state}
+    else
+      {%{queued: false, finalized: true, reason: reason}, updated_state}
+    end
+  end
 
   defp integrate_codex_update(running_entry, %{event: event, timestamp: timestamp} = update) do
     token_delta = extract_token_delta(running_entry, update)
@@ -1610,7 +2275,7 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   defp retry_candidate_issue?(%Issue{} = issue, terminal_states) do
-    candidate_issue?(issue, active_state_set(), terminal_states) and
+    base_candidate_issue?(issue, active_state_set(), terminal_states) and
       !todo_issue_blocked_by_non_terminal?(issue, terminal_states)
   end
 

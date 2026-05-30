@@ -37,6 +37,18 @@ defmodule SymphonyElixir.Linear.Adapter do
   }
   """
 
+  @comments_query """
+  query SymphonyIssueComments($issueId: String!) {
+    issue(id: $issueId) {
+      comments(first: 50) {
+        nodes {
+          body
+        }
+      }
+    }
+  }
+  """
+
   @spec fetch_candidate_issues() :: {:ok, [term()]} | {:error, term()}
   def fetch_candidate_issues, do: client_module().fetch_candidate_issues()
 
@@ -45,6 +57,24 @@ defmodule SymphonyElixir.Linear.Adapter do
 
   @spec fetch_issue_states_by_ids([String.t()]) :: {:ok, [term()]} | {:error, term()}
   def fetch_issue_states_by_ids(issue_ids), do: client_module().fetch_issue_states_by_ids(issue_ids)
+
+  @spec fetch_issue_comments(String.t()) :: {:ok, [String.t()]} | {:error, term()}
+  def fetch_issue_comments(issue_id) when is_binary(issue_id) do
+    with {:ok, response} <- client_module().graphql(@comments_query, %{issueId: issue_id}),
+         comments when is_list(comments) <- get_in(response, ["data", "issue", "comments", "nodes"]) do
+      {:ok,
+       comments
+       |> Enum.map(fn
+         %{"body" => body} when is_binary(body) -> body
+         %{body: body} when is_binary(body) -> body
+         _ -> nil
+       end)
+       |> Enum.reject(&is_nil/1)}
+    else
+      {:error, reason} -> {:error, reason}
+      _ -> {:error, :comments_fetch_failed}
+    end
+  end
 
   @spec create_comment(String.t(), String.t()) :: :ok | {:error, term()}
   def create_comment(issue_id, body) when is_binary(issue_id) and is_binary(body) do

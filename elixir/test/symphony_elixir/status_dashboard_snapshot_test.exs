@@ -166,6 +166,40 @@ defmodule SymphonyElixir.StatusDashboardSnapshotTest do
     refute backoff_line =~ "\\n"
   end
 
+  test "external waiting section shows no-token Codeup watches" do
+    snapshot_data =
+      {:ok,
+       %{
+         running: [],
+         retrying: [],
+         external_waiting: [
+           external_waiting_entry(%{
+             identifier: "FIR-16",
+             state: "Merging",
+             change_request_id: "4",
+             cr_status: "TO_BE_MERGED",
+             token_policy: :no_codex,
+             next_action: :wait,
+             observed_key: "codeup:org-123:6907286:4:TO_BE_MERGED:no-revision"
+           })
+         ],
+         codex_totals: %{input_tokens: 0, output_tokens: 0, total_tokens: 0, seconds_running: 0},
+         rate_limits: nil
+       }}
+
+    rendered = render_snapshot(snapshot_data, 0.0)
+
+    assert rendered =~ "External waiting"
+    assert rendered =~ "FIR-16"
+    assert rendered =~ "codeup#4"
+    assert rendered =~ "state=Merging"
+    assert rendered =~ "cr=TO_BE_MERGED"
+    assert rendered =~ "policy=no_codex"
+    assert rendered =~ "next=wait"
+    assert rendered =~ "No active agents"
+    assert rendered =~ "No queued retries"
+  end
+
   test "snapshot fixture: unlimited credits variant" do
     snapshot_data =
       {:ok,
@@ -223,6 +257,27 @@ defmodule SymphonyElixir.StatusDashboardSnapshotTest do
         attempt: 1,
         due_in_ms: 1_000,
         error: "retry scheduled"
+      },
+      overrides
+    )
+  end
+
+  defp external_waiting_entry(overrides) do
+    Map.merge(
+      %{
+        issue_id: "issue-external",
+        identifier: "MT-EXT",
+        state: "Merging",
+        provider: "codeup",
+        change_request_id: "4",
+        cr_status: "TO_BE_MERGED",
+        revision: nil,
+        observed_key: "codeup:org-123:6907286:4:TO_BE_MERGED:no-revision",
+        token_policy: :no_codex,
+        next_action: :wait,
+        error: nil,
+        last_checked_at: ~U[2026-05-30 10:00:00Z],
+        url: "https://codeup.example/change/4"
       },
       overrides
     )

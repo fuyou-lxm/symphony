@@ -32,6 +32,8 @@ agent:
     Merging: 1
   no_continuation_retry_states:
     - Merging
+  no_auto_codex_states:
+    - Merging
 codex:
   command: codex --config shell_environment_policy.inherit=all --config 'model="gpt-5.5"' --config model_reasoning_effort=xhigh app-server
   approval_policy: never
@@ -103,7 +105,7 @@ The agent should be able to talk to Linear, either via a configured Linear MCP s
 - `commit`: produce clean, logical commits during implementation.
 - `push`: keep remote branch current and publish updates.
 - `pull`: keep branch updated with latest `origin/main` before handoff.
-- `land`: when ticket reaches `Merging`, explicitly open and follow `.codex/skills/land/SKILL.md`, which includes the `land` loop.
+- `land`: when a tracked external PR/CR has changed state and Codex is explicitly resumed from `Merging`, use the land flow only for the single verification/closeout run.
 
 ## Status map
 
@@ -112,7 +114,7 @@ The agent should be able to talk to Linear, either via a configured Linear MCP s
   - Special case: if a PR is already attached, treat as feedback/rework loop (run full PR feedback sweep, address or explicitly push back, revalidate, return to `Human Review`).
 - `In Progress` -> implementation actively underway.
 - `Human Review` -> PR is attached and validated; waiting on human approval.
-- `Merging` -> approved by human; execute the `land` skill flow (do not call `gh pr merge` directly).
+- `Merging` -> external-event waiting state after human approval. Codex must not poll or retry here; Symphony tracks the external PR/CR through API polling and finalizes to `Done` or `Rework` without starting Codex. Human explicit resume is still allowed for manual intervention.
 - `Rework` -> reviewer requested changes; planning + implementation required.
 - `Done` -> terminal state; no further action required.
 
@@ -126,7 +128,7 @@ The agent should be able to talk to Linear, either via a configured Linear MCP s
      - If PR is already attached, start by reviewing all open PR comments and deciding required changes vs explicit pushback responses.
    - `In Progress` -> continue execution flow from current scratchpad comment.
    - `Human Review` -> wait and poll for decision/review updates.
-   - `Merging` -> on entry, open and follow `.codex/skills/land/SKILL.md`; do not call `gh pr merge` directly.
+   - `Merging` -> do not poll or retry from Codex; Symphony's external watcher handles merge-status polling and closeout without Codex. Only act if a human explicitly resumes the issue.
    - `Rework` -> run rework flow.
    - `Done` -> do nothing and shut down.
 4. Check whether a PR already exists for the current branch and whether it is closed.
@@ -248,8 +250,8 @@ Use this only when completion is blocked by missing required tools or missing au
 2. Poll for updates as needed, including GitHub PR review comments from humans and bots.
 3. If review feedback requires changes, move the issue to `Rework` and follow the rework flow.
 4. If approved, human moves the issue to `Merging`.
-5. When the issue is in `Merging`, open and follow `.codex/skills/land/SKILL.md`, then run the `land` skill in a loop until the PR is merged. Do not call `gh pr merge` directly.
-6. After merge is complete, move the issue to `Done`.
+5. When the issue is in `Merging`, do not use Codex as the merge-status poller. Symphony's external watcher polls the merge object and records the closeout evidence without starting Codex.
+6. After the external merge is complete, the watcher moves the issue to `Done`; if the external merge failed or was closed, it records evidence and moves the issue to `Rework` or surfaces the error for human handling.
 
 ## Step 4: Rework handling
 
@@ -319,6 +321,21 @@ Use this exact structure for the persistent workpad comment and keep it updated 
 ### Validation
 
 - [ ] targeted tests: `<command>`
+
+### Delivery Metadata
+
+```json
+{
+  "provider": "codeup",
+  "organization_id": "<required-org-id>",
+  "repo_id": "<repository-id-or-path>",
+  "change_request_id": "<local-cr-id>",
+  "source_branch": "<delivery-branch>",
+  "target_branch": "<target-branch>",
+  "delivery_commit": "<commit-sha>",
+  "last_observed_cr_state": "<state-at-handoff>"
+}
+```
 
 ### Notes
 

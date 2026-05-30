@@ -134,6 +134,7 @@ defmodule SymphonyElixir.Config.Schema do
       field(:max_turns_by_state, :map, default: %{})
       field(:max_concurrent_agents_by_state, :map, default: %{})
       field(:no_continuation_retry_states, {:array, :string}, default: [])
+      field(:no_auto_codex_states, {:array, :string}, default: [])
     end
 
     @spec changeset(%__MODULE__{}, map()) :: Ecto.Changeset.t()
@@ -147,7 +148,8 @@ defmodule SymphonyElixir.Config.Schema do
           :max_retry_backoff_ms,
           :max_turns_by_state,
           :max_concurrent_agents_by_state,
-          :no_continuation_retry_states
+          :no_continuation_retry_states,
+          :no_auto_codex_states
         ],
         empty_values: []
       )
@@ -159,6 +161,7 @@ defmodule SymphonyElixir.Config.Schema do
       |> Schema.validate_state_limits(:max_turns_by_state)
       |> Schema.validate_state_limits(:max_concurrent_agents_by_state)
       |> update_change(:no_continuation_retry_states, &Schema.normalize_state_names/1)
+      |> update_change(:no_auto_codex_states, &Schema.normalize_state_names/1)
     end
   end
 

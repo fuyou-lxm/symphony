@@ -82,6 +82,17 @@ defmodule SymphonyElixir.Config do
 
   def suppress_continuation_retry_for_state?(_state_name), do: false
 
+  @spec no_auto_codex_for_state?(term()) :: boolean()
+  def no_auto_codex_for_state?(state_name) when is_binary(state_name) do
+    normalized_state = Schema.normalize_issue_state(state_name)
+    agent = settings!().agent
+
+    normalized_state in agent.no_auto_codex_states ||
+      normalized_state in agent.no_continuation_retry_states
+  end
+
+  def no_auto_codex_for_state?(_state_name), do: false
+
   @spec codex_turn_sandbox_policy(Path.t() | nil) :: map()
   def codex_turn_sandbox_policy(workspace \\ nil) do
     case Schema.resolve_runtime_turn_sandbox_policy(settings!(), workspace) do

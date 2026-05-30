@@ -309,6 +309,11 @@ pre,
   min-width: 980px;
 }
 
+.data-table-external {
+  table-layout: fixed;
+  min-width: 1040px;
+}
+
 .data-table th {
   padding: 0 0.5rem 0.75rem 0;
   text-align: left;
@@ -377,6 +382,12 @@ pre,
   color: #8a5a00;
 }
 
+.state-badge-info {
+  background: #eef6ff;
+  border-color: #bfdcff;
+  color: #175cd3;
+}
+
 .state-badge-danger {
   background: var(--danger-soft);
   border-color: #f6d3cf;
@@ -395,6 +406,14 @@ pre,
 
 .muted {
   color: var(--muted);
+}
+
+.error-inline {
+  color: var(--danger);
+  max-width: 100%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .code-panel {
