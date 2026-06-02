@@ -200,6 +200,40 @@ defmodule SymphonyElixir.StatusDashboardSnapshotTest do
     assert rendered =~ "No queued retries"
   end
 
+  test "recent external finalizations section shows completed no-token Codeup watches" do
+    snapshot_data =
+      {:ok,
+       %{
+         running: [],
+         retrying: [],
+         external_waiting: [],
+         recent_external_finalizations: [
+           recent_external_finalization_entry(%{
+             identifier: "FIR-17",
+             change_request_id: "5",
+             cr_status: "MERGED",
+             revision: "775d6eab",
+             target_state: "Done",
+             reason: :external_merged,
+             workspace_cleanup: :ok
+           })
+         ],
+         codex_totals: %{input_tokens: 0, output_tokens: 0, total_tokens: 0, seconds_running: 0},
+         rate_limits: nil
+       }}
+
+    rendered = render_snapshot(snapshot_data, 0.0)
+
+    assert rendered =~ "Recent external finalizations"
+    assert rendered =~ "FIR-17"
+    assert rendered =~ "codeup#5"
+    assert rendered =~ "cr=MERGED"
+    assert rendered =~ "revision=775d6eab"
+    assert rendered =~ "target=Done"
+    assert rendered =~ "reason=external_merged"
+    assert rendered =~ "cleanup=ok"
+  end
+
   test "snapshot fixture: unlimited credits variant" do
     snapshot_data =
       {:ok,
@@ -278,6 +312,28 @@ defmodule SymphonyElixir.StatusDashboardSnapshotTest do
         error: nil,
         last_checked_at: ~U[2026-05-30 10:00:00Z],
         url: "https://codeup.example/change/4"
+      },
+      overrides
+    )
+  end
+
+  defp recent_external_finalization_entry(overrides) do
+    Map.merge(
+      %{
+        issue_id: "issue-recent-external",
+        identifier: "MT-RECENT",
+        state: "Merging",
+        provider: "codeup",
+        change_request_id: "5",
+        cr_status: "MERGED",
+        revision: "rev-5",
+        observed_key: "codeup:org-123:6907286:5:MERGED:rev-5",
+        target_state: "Done",
+        reason: :external_merged,
+        token_policy: :no_codex,
+        workspace_cleanup: :ok,
+        finalized_at: ~U[2026-05-30 10:05:00Z],
+        url: "https://codeup.example/change/5"
       },
       overrides
     )

@@ -632,6 +632,62 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
     end
   end
 
+  test "workspace runs after external waiting start hook without deleting workspace" do
+    test_root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-elixir-external-waiting-hook-#{System.unique_integer([:positive])}"
+      )
+
+    try do
+      workspace_root = Path.join(test_root, "workspaces")
+      marker = Path.join(test_root, "after-external-waiting-start.log")
+
+      File.mkdir_p!(workspace_root)
+
+      write_workflow_file!(Workflow.workflow_file_path(),
+        workspace_root: workspace_root,
+        hook_after_external_waiting_start: "printf '%s' \"$PWD\" > \"#{marker}\""
+      )
+
+      config = Config.settings!()
+      assert config.hooks.after_external_waiting_start =~ "after-external-waiting-start.log"
+
+      assert {:ok, workspace} = Workspace.create_for_issue("MT-EXT-HOOK")
+      assert :ok = Workspace.run_after_external_waiting_start_hook(workspace, "MT-EXT-HOOK")
+
+      assert File.read!(marker) == workspace
+      assert File.dir?(workspace)
+    after
+      File.rm_rf(test_root)
+    end
+  end
+
+  test "workspace ignores after external waiting start hook failures" do
+    test_root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-elixir-external-waiting-hook-failure-#{System.unique_integer([:positive])}"
+      )
+
+    try do
+      workspace_root = Path.join(test_root, "workspaces")
+
+      File.mkdir_p!(workspace_root)
+
+      write_workflow_file!(Workflow.workflow_file_path(),
+        workspace_root: workspace_root,
+        hook_after_external_waiting_start: "echo failure && exit 17"
+      )
+
+      assert {:ok, workspace} = Workspace.create_for_issue("MT-EXT-HOOK-FAIL")
+      assert :ok = Workspace.run_after_external_waiting_start_hook(workspace, "MT-EXT-HOOK-FAIL")
+      assert File.dir?(workspace)
+    after
+      File.rm_rf(test_root)
+    end
+  end
+
   test "workspace remove continues when before_remove hook fails" do
     test_root =
       Path.join(
@@ -721,8 +777,15 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
 
   test "config reads defaults for optional settings" do
     previous_linear_api_key = System.get_env("LINEAR_API_KEY")
-    on_exit(fn -> restore_env("LINEAR_API_KEY", previous_linear_api_key) end)
+    previous_gemini_api_key = System.get_env("GEMINI_API_KEY")
+
+    on_exit(fn ->
+      restore_env("LINEAR_API_KEY", previous_linear_api_key)
+      restore_env("GEMINI_API_KEY", previous_gemini_api_key)
+    end)
+
     System.delete_env("LINEAR_API_KEY")
+    System.put_env("GEMINI_API_KEY", "env-gemini-key")
 
     write_workflow_file!(Workflow.workflow_file_path(),
       workspace_root: nil,
@@ -744,7 +807,28 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
     assert config.workspace.root == Path.join(System.tmp_dir!(), "symphony_workspaces")
     assert config.worker.max_concurrent_agents_per_host == nil
     assert config.agent.max_concurrent_agents == 10
+    assert config.agent.max_process_tree_rss_bytes == nil
+    assert config.agent.dispatch_rss_reservation_bytes == nil
+    assert config.agent.provider == "codex"
     assert config.codex.command == "codex app-server"
+    assert config.antigravity.python == "python3"
+    assert String.ends_with?(config.antigravity.runner, "priv/antigravity_sdk_runner.py")
+    assert config.antigravity.model == nil
+    assert config.antigravity.api_key == nil
+    assert config.antigravity.app_data_dir == nil
+    assert config.antigravity.save_dir == nil
+    assert config.antigravity.approval_policy == "never"
+    assert config.antigravity.turn_timeout_ms == 3_600_000
+    assert config.antigravity.read_timeout_ms == 5_000
+    assert config.antigravity_cli.command == "agy"
+    assert config.antigravity_cli.approval_policy == "never"
+    assert config.antigravity_cli.print_timeout == "5m"
+    assert config.antigravity_cli.turn_timeout_ms == 3_600_000
+    assert config.observability.dashboard_enabled == true
+    assert config.observability.terminal_dashboard_enabled == true
+    assert config.observability.refresh_ms == 1_000
+    assert config.observability.render_interval_ms == 1_000
+    assert config.observability.state_sample_interval_ms == 5_000
 
     assert config.codex.approval_policy == %{
              "reject" => %{
@@ -818,6 +902,14 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
     assert {:error, {:invalid_workflow_config, message}} = Config.validate!()
     assert message =~ "agent.max_concurrent_agents"
 
+    write_workflow_file!(Workflow.workflow_file_path(), max_process_tree_rss_bytes: "bad")
+    assert {:error, {:invalid_workflow_config, message}} = Config.validate!()
+    assert message =~ "agent.max_process_tree_rss_bytes"
+
+    write_workflow_file!(Workflow.workflow_file_path(), dispatch_rss_reservation_bytes: "bad")
+    assert {:error, {:invalid_workflow_config, message}} = Config.validate!()
+    assert message =~ "agent.dispatch_rss_reservation_bytes"
+
     write_workflow_file!(Workflow.workflow_file_path(), worker_max_concurrent_agents_per_host: 0)
     assert {:error, {:invalid_workflow_config, message}} = Config.validate!()
     assert message =~ "worker.max_concurrent_agents_per_host"
@@ -845,6 +937,7 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
       observability_enabled: "maybe",
       observability_refresh_ms: %{bad: true},
       observability_render_interval_ms: %{bad: true},
+      observability_state_sample_interval_ms: 0,
       server_port: -1,
       server_host: 123
     )
@@ -885,6 +978,61 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
 
     write_workflow_file!(Workflow.workflow_file_path(), codex_command: "codex app-server")
     assert Config.settings!().codex.command == "codex app-server"
+
+    write_workflow_file!(Workflow.workflow_file_path(),
+      agent_provider: "antigravity_sdk",
+      antigravity_python: "/opt/py/bin/python",
+      antigravity_runner: "/opt/symphony/antigravity_runner.py",
+      antigravity_model: "gemini-3.5-pro",
+      antigravity_api_key: "$GEMINI_API_KEY",
+      antigravity_app_data_dir: "/tmp/ag-app-data",
+      antigravity_save_dir: "/tmp/ag-save",
+      antigravity_approval_policy: "on-request",
+      antigravity_turn_timeout_ms: 42_000,
+      antigravity_read_timeout_ms: 2_000
+    )
+
+    config = Config.settings!()
+    assert config.agent.provider == "antigravity_sdk"
+    assert config.antigravity.python == "/opt/py/bin/python"
+    assert config.antigravity.runner == "/opt/symphony/antigravity_runner.py"
+    assert config.antigravity.model == "gemini-3.5-pro"
+    assert config.antigravity.api_key == System.get_env("GEMINI_API_KEY")
+    assert config.antigravity.app_data_dir == "/tmp/ag-app-data"
+    assert config.antigravity.save_dir == "/tmp/ag-save"
+    assert config.antigravity.approval_policy == "on-request"
+    assert config.antigravity.turn_timeout_ms == 42_000
+    assert config.antigravity.read_timeout_ms == 2_000
+
+    write_workflow_file!(Workflow.workflow_file_path(),
+      agent_provider: "antigravity_cli",
+      antigravity_cli_command: "/opt/bin/agy",
+      antigravity_cli_approval_policy: "on-request",
+      antigravity_cli_print_timeout: "90s",
+      antigravity_cli_turn_timeout_ms: 120_000
+    )
+
+    config = Config.settings!()
+    assert config.agent.provider == "antigravity_cli"
+    assert config.antigravity_cli.command == "/opt/bin/agy"
+    assert config.antigravity_cli.approval_policy == "on-request"
+    assert config.antigravity_cli.print_timeout == "90s"
+    assert config.antigravity_cli.turn_timeout_ms == 120_000
+    assert :ok = Config.validate!()
+
+    write_workflow_file!(Workflow.workflow_file_path(), agent_provider: "antigravity_sdk")
+    assert Config.settings!().antigravity.api_key == nil
+
+    write_workflow_file!(Workflow.workflow_file_path(), agent_provider: "unknown-agent")
+    assert {:error, {:unsupported_agent_provider, "unknown-agent"}} = Config.validate!()
+
+    write_workflow_file!(Workflow.workflow_file_path(), antigravity_approval_policy: "maybe")
+    assert {:error, {:invalid_workflow_config, message}} = Config.validate!()
+    assert message =~ "antigravity.approval_policy"
+
+    write_workflow_file!(Workflow.workflow_file_path(), antigravity_cli_approval_policy: "maybe")
+    assert {:error, {:invalid_workflow_config, message}} = Config.validate!()
+    assert message =~ "antigravity_cli.approval_policy"
   end
 
   test "config resolves $VAR references for env-backed secret and path values" do
@@ -1279,6 +1427,7 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
         worker_ssh_hosts: ["worker-01:2200"],
         hook_before_run: "echo before-run",
         hook_after_run: "echo after-run",
+        hook_after_external_waiting_start: "echo after-external-waiting-start",
         hook_before_remove: "echo before-remove"
       )
 
@@ -1287,6 +1436,8 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
       assert {:ok, ^workspace_path} = Workspace.create_for_issue("MT-SSH-WS", "worker-01:2200")
       assert :ok = Workspace.run_before_run_hook(workspace_path, "MT-SSH-WS", "worker-01:2200")
       assert :ok = Workspace.run_after_run_hook(workspace_path, "MT-SSH-WS", "worker-01:2200")
+      assert :ok = Workspace.run_after_external_waiting_start_hook(workspace_path, "MT-SSH-WS", "worker-01:2200")
+      assert :ok = Workspace.run_after_external_waiting_start_hook_for_issue("MT-SSH-WS")
       assert :ok = Workspace.remove_issue_workspaces("MT-SSH-WS", "worker-01:2200")
 
       trace = File.read!(trace_file)
@@ -1296,6 +1447,8 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
       assert trace =~ "${workspace#~/}"
       assert trace =~ "echo before-run"
       assert trace =~ "echo after-run"
+      assert trace =~ "echo after-external-waiting-start"
+      assert trace =~ "if [ -d \"$workspace\" ]; then"
       assert trace =~ "echo before-remove"
       assert trace =~ "rm -rf"
       assert trace =~ workspace_path

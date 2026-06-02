@@ -230,7 +230,7 @@ defmodule SymphonyElixir.ExternalMergeWatcher do
   end
 
   defp normalize_delivery_metadata(raw_metadata) when is_map(raw_metadata) do
-    provider = raw_metadata |> pick_string(["provider", :provider]) |> normalize_downcase()
+    provider = raw_metadata |> pick_string(["provider", :provider]) |> normalize_provider()
 
     if provider == "codeup" do
       with {:ok, organization_id} <-
@@ -313,6 +313,13 @@ defmodule SymphonyElixir.ExternalMergeWatcher do
     value
     |> String.trim()
     |> String.downcase()
+  end
+
+  defp normalize_provider(value) do
+    case normalize_downcase(value) do
+      provider when provider in ["codeup", "yunxiao_codeup", "yunxiao-codeup", "yunxiao codeup"] -> "codeup"
+      provider -> provider
+    end
   end
 
   defp fetch_change_request(metadata, opts) do

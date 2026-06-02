@@ -4,7 +4,7 @@ defmodule SymphonyElixir.HttpServer do
   """
 
   alias SymphonyElixir.{Config, Orchestrator}
-  alias SymphonyElixirWeb.Endpoint
+  alias SymphonyElixirWeb.{Endpoint, ObservabilitySampler}
 
   @secret_key_bytes 48
 
@@ -40,6 +40,7 @@ defmodule SymphonyElixir.HttpServer do
             |> Keyword.merge(endpoint_opts)
 
           Application.put_env(:symphony_elixir, Endpoint, endpoint_config)
+          ObservabilitySampler.configure(orchestrator: orchestrator, snapshot_timeout_ms: snapshot_timeout_ms)
           Endpoint.start_link()
         end
 

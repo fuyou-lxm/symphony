@@ -75,7 +75,13 @@ defmodule SymphonyElixir.TestSupport do
   def restore_env(key, value), do: System.put_env(key, value)
 
   def stop_default_http_server do
-    case Enum.find(Supervisor.which_children(SymphonyElixir.Supervisor), fn
+    children =
+      case Process.whereis(SymphonyElixir.Supervisor) do
+        nil -> []
+        _pid -> Supervisor.which_children(SymphonyElixir.Supervisor)
+      end
+
+    case Enum.find(children, fn
            {SymphonyElixir.HttpServer, _pid, _type, _modules} -> true
            _child -> false
          end) do
@@ -109,11 +115,15 @@ defmodule SymphonyElixir.TestSupport do
           worker_ssh_hosts: [],
           worker_max_concurrent_agents_per_host: nil,
           max_concurrent_agents: 10,
+          max_process_tree_rss_bytes: nil,
+          dispatch_rss_reservation_bytes: nil,
+          memory_watchdog_interval_ms: nil,
           max_turns: 20,
           max_retry_backoff_ms: 300_000,
           max_turns_by_state: %{},
           max_concurrent_agents_by_state: %{},
           no_continuation_retry_states: [],
+          agent_provider: "codex",
           codex_command: "codex app-server",
           codex_approval_policy: %{reject: %{sandbox_approval: true, rules: true, mcp_elicitations: true}},
           codex_thread_sandbox: "workspace-write",
@@ -121,14 +131,30 @@ defmodule SymphonyElixir.TestSupport do
           codex_turn_timeout_ms: 3_600_000,
           codex_read_timeout_ms: 5_000,
           codex_stall_timeout_ms: 300_000,
+          antigravity_python: "python3",
+          antigravity_runner: nil,
+          antigravity_model: nil,
+          antigravity_api_key: nil,
+          antigravity_app_data_dir: nil,
+          antigravity_save_dir: nil,
+          antigravity_approval_policy: "never",
+          antigravity_turn_timeout_ms: 3_600_000,
+          antigravity_read_timeout_ms: 5_000,
+          antigravity_cli_command: "agy",
+          antigravity_cli_approval_policy: "never",
+          antigravity_cli_print_timeout: "5m",
+          antigravity_cli_turn_timeout_ms: 3_600_000,
           hook_after_create: nil,
           hook_before_run: nil,
           hook_after_run: nil,
+          hook_after_external_waiting_start: nil,
           hook_before_remove: nil,
           hook_timeout_ms: 60_000,
           observability_enabled: true,
+          observability_terminal_dashboard_enabled: true,
           observability_refresh_ms: 1_000,
-          observability_render_interval_ms: 16,
+          observability_render_interval_ms: 1_000,
+          observability_state_sample_interval_ms: nil,
           server_port: nil,
           server_host: nil,
           prompt: @workflow_prompt
@@ -148,12 +174,16 @@ defmodule SymphonyElixir.TestSupport do
     worker_ssh_hosts = Keyword.get(config, :worker_ssh_hosts)
     worker_max_concurrent_agents_per_host = Keyword.get(config, :worker_max_concurrent_agents_per_host)
     max_concurrent_agents = Keyword.get(config, :max_concurrent_agents)
+    max_process_tree_rss_bytes = Keyword.get(config, :max_process_tree_rss_bytes)
+    dispatch_rss_reservation_bytes = Keyword.get(config, :dispatch_rss_reservation_bytes)
+    memory_watchdog_interval_ms = Keyword.get(config, :memory_watchdog_interval_ms)
     max_turns = Keyword.get(config, :max_turns)
     max_retry_backoff_ms = Keyword.get(config, :max_retry_backoff_ms)
     max_turns_by_state = Keyword.get(config, :max_turns_by_state)
     max_concurrent_agents_by_state = Keyword.get(config, :max_concurrent_agents_by_state)
     no_continuation_retry_states = Keyword.get(config, :no_continuation_retry_states)
     no_auto_codex_states = Keyword.get(config, :no_auto_codex_states)
+    agent_provider = Keyword.get(config, :agent_provider)
     codex_command = Keyword.get(config, :codex_command)
     codex_approval_policy = Keyword.get(config, :codex_approval_policy)
     codex_thread_sandbox = Keyword.get(config, :codex_thread_sandbox)
@@ -161,14 +191,30 @@ defmodule SymphonyElixir.TestSupport do
     codex_turn_timeout_ms = Keyword.get(config, :codex_turn_timeout_ms)
     codex_read_timeout_ms = Keyword.get(config, :codex_read_timeout_ms)
     codex_stall_timeout_ms = Keyword.get(config, :codex_stall_timeout_ms)
+    antigravity_python = Keyword.get(config, :antigravity_python)
+    antigravity_runner = Keyword.get(config, :antigravity_runner)
+    antigravity_model = Keyword.get(config, :antigravity_model)
+    antigravity_api_key = Keyword.get(config, :antigravity_api_key)
+    antigravity_app_data_dir = Keyword.get(config, :antigravity_app_data_dir)
+    antigravity_save_dir = Keyword.get(config, :antigravity_save_dir)
+    antigravity_approval_policy = Keyword.get(config, :antigravity_approval_policy)
+    antigravity_turn_timeout_ms = Keyword.get(config, :antigravity_turn_timeout_ms)
+    antigravity_read_timeout_ms = Keyword.get(config, :antigravity_read_timeout_ms)
+    antigravity_cli_command = Keyword.get(config, :antigravity_cli_command)
+    antigravity_cli_approval_policy = Keyword.get(config, :antigravity_cli_approval_policy)
+    antigravity_cli_print_timeout = Keyword.get(config, :antigravity_cli_print_timeout)
+    antigravity_cli_turn_timeout_ms = Keyword.get(config, :antigravity_cli_turn_timeout_ms)
     hook_after_create = Keyword.get(config, :hook_after_create)
     hook_before_run = Keyword.get(config, :hook_before_run)
     hook_after_run = Keyword.get(config, :hook_after_run)
+    hook_after_external_waiting_start = Keyword.get(config, :hook_after_external_waiting_start)
     hook_before_remove = Keyword.get(config, :hook_before_remove)
     hook_timeout_ms = Keyword.get(config, :hook_timeout_ms)
     observability_enabled = Keyword.get(config, :observability_enabled)
+    observability_terminal_dashboard_enabled = Keyword.get(config, :observability_terminal_dashboard_enabled)
     observability_refresh_ms = Keyword.get(config, :observability_refresh_ms)
     observability_render_interval_ms = Keyword.get(config, :observability_render_interval_ms)
+    observability_state_sample_interval_ms = Keyword.get(config, :observability_state_sample_interval_ms)
     server_port = Keyword.get(config, :server_port)
     server_host = Keyword.get(config, :server_host)
     prompt = Keyword.get(config, :prompt)
@@ -191,12 +237,16 @@ defmodule SymphonyElixir.TestSupport do
         worker_yaml(worker_ssh_hosts, worker_max_concurrent_agents_per_host),
         "agent:",
         "  max_concurrent_agents: #{yaml_value(max_concurrent_agents)}",
+        "  max_process_tree_rss_bytes: #{yaml_value(max_process_tree_rss_bytes)}",
+        "  dispatch_rss_reservation_bytes: #{yaml_value(dispatch_rss_reservation_bytes)}",
+        "  memory_watchdog_interval_ms: #{yaml_value(memory_watchdog_interval_ms)}",
         "  max_turns: #{yaml_value(max_turns)}",
         "  max_retry_backoff_ms: #{yaml_value(max_retry_backoff_ms)}",
         "  max_turns_by_state: #{yaml_value(max_turns_by_state)}",
         "  max_concurrent_agents_by_state: #{yaml_value(max_concurrent_agents_by_state)}",
         "  no_continuation_retry_states: #{yaml_value(no_continuation_retry_states)}",
         "  no_auto_codex_states: #{yaml_value(no_auto_codex_states)}",
+        "  provider: #{yaml_value(agent_provider)}",
         "codex:",
         "  command: #{yaml_value(codex_command)}",
         "  approval_policy: #{yaml_value(codex_approval_policy)}",
@@ -205,8 +255,36 @@ defmodule SymphonyElixir.TestSupport do
         "  turn_timeout_ms: #{yaml_value(codex_turn_timeout_ms)}",
         "  read_timeout_ms: #{yaml_value(codex_read_timeout_ms)}",
         "  stall_timeout_ms: #{yaml_value(codex_stall_timeout_ms)}",
-        hooks_yaml(hook_after_create, hook_before_run, hook_after_run, hook_before_remove, hook_timeout_ms),
-        observability_yaml(observability_enabled, observability_refresh_ms, observability_render_interval_ms),
+        "antigravity:",
+        "  python: #{yaml_value(antigravity_python)}",
+        "  runner: #{yaml_value(antigravity_runner)}",
+        "  model: #{yaml_value(antigravity_model)}",
+        "  api_key: #{yaml_value(antigravity_api_key)}",
+        "  app_data_dir: #{yaml_value(antigravity_app_data_dir)}",
+        "  save_dir: #{yaml_value(antigravity_save_dir)}",
+        "  approval_policy: #{yaml_value(antigravity_approval_policy)}",
+        "  turn_timeout_ms: #{yaml_value(antigravity_turn_timeout_ms)}",
+        "  read_timeout_ms: #{yaml_value(antigravity_read_timeout_ms)}",
+        "antigravity_cli:",
+        "  command: #{yaml_value(antigravity_cli_command)}",
+        "  approval_policy: #{yaml_value(antigravity_cli_approval_policy)}",
+        "  print_timeout: #{yaml_value(antigravity_cli_print_timeout)}",
+        "  turn_timeout_ms: #{yaml_value(antigravity_cli_turn_timeout_ms)}",
+        hooks_yaml(
+          hook_after_create,
+          hook_before_run,
+          hook_after_run,
+          hook_after_external_waiting_start,
+          hook_before_remove,
+          hook_timeout_ms
+        ),
+        observability_yaml(
+          observability_enabled,
+          observability_terminal_dashboard_enabled,
+          observability_refresh_ms,
+          observability_render_interval_ms,
+          observability_state_sample_interval_ms
+        ),
         server_yaml(server_port, server_host),
         "---",
         prompt
@@ -238,15 +316,23 @@ defmodule SymphonyElixir.TestSupport do
 
   defp yaml_value(value), do: yaml_value(to_string(value))
 
-  defp hooks_yaml(nil, nil, nil, nil, timeout_ms), do: "hooks:\n  timeout_ms: #{yaml_value(timeout_ms)}"
+  defp hooks_yaml(nil, nil, nil, nil, nil, timeout_ms), do: "hooks:\n  timeout_ms: #{yaml_value(timeout_ms)}"
 
-  defp hooks_yaml(hook_after_create, hook_before_run, hook_after_run, hook_before_remove, timeout_ms) do
+  defp hooks_yaml(
+         hook_after_create,
+         hook_before_run,
+         hook_after_run,
+         hook_after_external_waiting_start,
+         hook_before_remove,
+         timeout_ms
+       ) do
     [
       "hooks:",
       "  timeout_ms: #{yaml_value(timeout_ms)}",
       hook_entry("after_create", hook_after_create),
       hook_entry("before_run", hook_before_run),
       hook_entry("after_run", hook_after_run),
+      hook_entry("after_external_waiting_start", hook_after_external_waiting_start),
       hook_entry("before_remove", hook_before_remove)
     ]
     |> Enum.reject(&is_nil/1)
@@ -268,13 +354,16 @@ defmodule SymphonyElixir.TestSupport do
     |> Enum.join("\n")
   end
 
-  defp observability_yaml(enabled, refresh_ms, render_interval_ms) do
+  defp observability_yaml(enabled, terminal_dashboard_enabled, refresh_ms, render_interval_ms, state_sample_interval_ms) do
     [
       "observability:",
       "  dashboard_enabled: #{yaml_value(enabled)}",
+      "  terminal_dashboard_enabled: #{yaml_value(terminal_dashboard_enabled)}",
       "  refresh_ms: #{yaml_value(refresh_ms)}",
-      "  render_interval_ms: #{yaml_value(render_interval_ms)}"
+      "  render_interval_ms: #{yaml_value(render_interval_ms)}",
+      !is_nil(state_sample_interval_ms) && "  state_sample_interval_ms: #{yaml_value(state_sample_interval_ms)}"
     ]
+    |> Enum.reject(&(&1 in [nil, false]))
     |> Enum.join("\n")
   end
 

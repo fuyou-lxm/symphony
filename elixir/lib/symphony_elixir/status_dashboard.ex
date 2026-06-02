@@ -15,6 +15,8 @@ defmodule SymphonyElixir.StatusDashboard do
   @throughput_graph_window_ms 10 * 60 * 1000
   @throughput_graph_columns 24
   @sparkline_blocks ["▁", "▂", "▃", "▄", "▅", "▆", "▇", "█"]
+  @pending_table :symphony_status_dashboard_pending
+  @pending_key_prefix :terminal_refresh
   @running_id_width 8
   @running_stage_width 14
   @running_pid_width 8
@@ -53,6 +55,8 @@ defmodule SymphonyElixir.StatusDashboard do
     :last_rendered_at_ms,
     :pending_content,
     :flush_timer_ref,
+    :refresh_timer_ref,
+    :refresh_pending_key,
     :last_snapshot_fingerprint
   ]
 
@@ -71,6 +75,8 @@ defmodule SymphonyElixir.StatusDashboard do
           last_rendered_at_ms: integer() | nil,
           pending_content: String.t() | nil,
           flush_timer_ref: reference() | nil,
+          refresh_timer_ref: reference() | nil,
+          refresh_pending_key: term() | nil,
           last_snapshot_fingerprint: term() | nil
         }
 
@@ -86,7 +92,7 @@ defmodule SymphonyElixir.StatusDashboard do
 
     case GenServer.whereis(server) do
       pid when is_pid(pid) ->
-        send(pid, :refresh)
+        queue_refresh(server, pid)
         :ok
 
       _ ->
@@ -96,6 +102,8 @@ defmodule SymphonyElixir.StatusDashboard do
 
   @spec init(keyword()) :: {:ok, t()}
   def init(opts) do
+    init_pending_table()
+
     refresh_ms_override = keyword_override(opts, :refresh_ms)
     enabled_override = keyword_override(opts, :enabled)
     render_interval_ms_override = keyword_override(opts, :render_interval_ms)
@@ -103,7 +111,7 @@ defmodule SymphonyElixir.StatusDashboard do
     refresh_ms = refresh_ms_override || observability.refresh_ms
     render_interval_ms = render_interval_ms_override || observability.render_interval_ms
     render_fun = Keyword.get(opts, :render_fun, &render_to_terminal/1)
-    enabled = resolve_override(enabled_override, observability.dashboard_enabled and dashboard_enabled?())
+    enabled = resolve_override(enabled_override, terminal_dashboard_enabled?(observability))
     schedule_tick(refresh_ms, enabled)
 
     {:ok,
@@ -122,6 +130,8 @@ defmodule SymphonyElixir.StatusDashboard do
        last_rendered_at_ms: nil,
        pending_content: nil,
        flush_timer_ref: nil,
+       refresh_timer_ref: nil,
+       refresh_pending_key: nil,
        last_snapshot_fingerprint: nil
      }}
   end
@@ -152,8 +162,33 @@ defmodule SymphonyElixir.StatusDashboard do
     {:noreply, state}
   end
 
+  def handle_info({:refresh, pending_key}, state) do
+    state = refresh_runtime_config(state)
+
+    if state.enabled do
+      {:noreply, maybe_render_or_schedule_refresh(state, pending_key)}
+    else
+      clear_pending_refresh(pending_key)
+      {:noreply, %{state | refresh_timer_ref: nil, refresh_pending_key: nil}}
+    end
+  end
+
   def handle_info(:refresh, %{enabled: true} = state), do: {:noreply, maybe_render(refresh_runtime_config(state))}
   def handle_info(:refresh, state), do: {:noreply, state}
+
+  def handle_info({:flush_refresh, timer_ref, pending_key}, %{refresh_timer_ref: timer_ref} = state) do
+    clear_pending_refresh(pending_key)
+
+    state =
+      state
+      |> refresh_runtime_config()
+      |> Map.put(:refresh_timer_ref, nil)
+      |> Map.put(:refresh_pending_key, nil)
+
+    {:noreply, if(state.enabled, do: maybe_render(state), else: state)}
+  end
+
+  def handle_info({:flush_refresh, _timer_ref, _pending_key}, state), do: {:noreply, state}
 
   def handle_info({:flush_render, timer_ref}, %{enabled: true, flush_timer_ref: timer_ref} = state) do
     now_ms = System.monotonic_time(:millisecond)
@@ -181,7 +216,7 @@ defmodule SymphonyElixir.StatusDashboard do
 
     %{
       state
-      | enabled: resolve_override(state.enabled_override, observability.dashboard_enabled and dashboard_enabled?()),
+      | enabled: resolve_override(state.enabled_override, terminal_dashboard_enabled?(observability)),
         refresh_ms: state.refresh_ms_override || observability.refresh_ms,
         render_interval_ms: state.render_interval_ms_override || observability.render_interval_ms
     }
@@ -189,6 +224,37 @@ defmodule SymphonyElixir.StatusDashboard do
 
   defp schedule_tick(refresh_ms, true), do: Process.send_after(self(), :tick, refresh_ms)
   defp schedule_tick(_refresh_ms, false), do: :ok
+
+  defp maybe_render_or_schedule_refresh(state, pending_key) do
+    now_ms = System.monotonic_time(:millisecond)
+    delay_ms = refresh_delay_ms(state, now_ms)
+
+    if delay_ms <= 0 do
+      clear_pending_refresh(pending_key)
+      maybe_render(%{state | refresh_timer_ref: nil, refresh_pending_key: nil})
+    else
+      schedule_pending_refresh(state, pending_key, delay_ms)
+    end
+  end
+
+  defp refresh_delay_ms(%{last_rendered_at_ms: nil}, _now_ms), do: 0
+
+  defp refresh_delay_ms(%{last_rendered_at_ms: last_rendered_at_ms, render_interval_ms: render_interval_ms}, now_ms)
+       when is_integer(last_rendered_at_ms) and is_integer(render_interval_ms) do
+    max(render_interval_ms - (now_ms - last_rendered_at_ms), 0)
+  end
+
+  defp refresh_delay_ms(_state, _now_ms), do: 0
+
+  defp schedule_pending_refresh(%{refresh_timer_ref: timer_ref} = state, _pending_key, _delay_ms)
+       when is_reference(timer_ref),
+       do: state
+
+  defp schedule_pending_refresh(state, pending_key, delay_ms) do
+    timer_ref = make_ref()
+    Process.send_after(self(), {:flush_refresh, timer_ref, pending_key}, max(delay_ms, 1))
+    %{state | refresh_timer_ref: timer_ref, refresh_pending_key: pending_key}
+  end
 
   defp maybe_render(state) do
     now_ms = System.monotonic_time(:millisecond)
@@ -305,11 +371,54 @@ defmodule SymphonyElixir.StatusDashboard do
       %{state | pending_content: nil, flush_timer_ref: nil}
   end
 
+  defp init_pending_table do
+    case :ets.whereis(@pending_table) do
+      :undefined ->
+        :ets.new(@pending_table, [:named_table, :public, :set, read_concurrency: true, write_concurrency: true])
+
+      _table ->
+        :ok
+    end
+  rescue
+    ArgumentError -> :ok
+  end
+
+  defp queue_refresh(server, pid) when is_pid(pid) do
+    pending_key = pending_refresh_key(server, pid)
+
+    if insert_pending_refresh(pending_key) do
+      send(pid, {:refresh, pending_key})
+    end
+
+    :ok
+  end
+
+  defp pending_refresh_key(server, pid) do
+    {@pending_key_prefix, server, pid}
+  end
+
+  defp insert_pending_refresh(pending_key) do
+    init_pending_table()
+    :ets.insert_new(@pending_table, {pending_key, true})
+  rescue
+    ArgumentError -> true
+  end
+
+  defp clear_pending_refresh(nil), do: :ok
+
+  defp clear_pending_refresh(pending_key) do
+    :ets.delete(@pending_table, pending_key)
+    :ok
+  rescue
+    ArgumentError -> :ok
+  end
+
   defp snapshot_with_samples(token_samples, now_ms) do
     case snapshot_payload() do
       {:ok, %{running: running, retrying: retrying, codex_totals: codex_totals} = snapshot} ->
         total_tokens = Map.get(codex_totals, :total_tokens, 0)
         external_waiting = Map.get(snapshot, :external_waiting, [])
+        recent_external_finalizations = Map.get(snapshot, :recent_external_finalizations, [])
 
         {
           {:ok,
@@ -317,6 +426,7 @@ defmodule SymphonyElixir.StatusDashboard do
              running: running,
              retrying: retrying,
              external_waiting: external_waiting,
+             recent_external_finalizations: recent_external_finalizations,
              codex_totals: codex_totals,
              rate_limits: Map.get(snapshot, :rate_limits),
              polling: Map.get(snapshot, :polling)
@@ -337,6 +447,7 @@ defmodule SymphonyElixir.StatusDashboard do
       {:ok, %{running: running, retrying: retrying, codex_totals: codex_totals} = snapshot} ->
         rate_limits = Map.get(snapshot, :rate_limits)
         external_waiting = Map.get(snapshot, :external_waiting, [])
+        recent_external_finalizations = Map.get(snapshot, :recent_external_finalizations, [])
         project_link_lines = format_project_link_lines()
         project_refresh_line = format_project_refresh_line(Map.get(snapshot, :polling))
         codex_input_tokens = Map.get(codex_totals, :input_tokens, 0)
@@ -350,6 +461,16 @@ defmodule SymphonyElixir.StatusDashboard do
         running_to_backoff_spacer = if(running == [], do: [], else: ["│"])
         external_waiting_rows = format_external_waiting_rows(external_waiting)
         external_waiting_to_backoff_spacer = if(external_waiting == [], do: [], else: ["│"])
+
+        recent_external_finalization_section =
+          if recent_external_finalizations == [] do
+            []
+          else
+            [colorize("├─ Recent external finalizations", @ansi_bold), "│"] ++
+              format_recent_external_finalization_rows(recent_external_finalizations) ++
+              ["│"]
+          end
+
         backoff_rows = format_retry_rows(retrying)
 
         ([
@@ -380,6 +501,7 @@ defmodule SymphonyElixir.StatusDashboard do
            [colorize("├─ External waiting", @ansi_bold), "│"] ++
            external_waiting_rows ++
            external_waiting_to_backoff_spacer ++
+           recent_external_finalization_section ++
            [colorize("├─ Backoff queue", @ansi_bold), "│"] ++
            backoff_rows ++
            [closing_border()])
@@ -569,6 +691,7 @@ defmodule SymphonyElixir.StatusDashboard do
              running: running,
              retrying: retrying,
              external_waiting: Map.get(snapshot, :external_waiting, []),
+             recent_external_finalizations: Map.get(snapshot, :recent_external_finalizations, []),
              codex_totals: codex_totals,
              rate_limits: Map.get(snapshot, :rate_limits),
              polling: Map.get(snapshot, :polling)
@@ -724,6 +847,58 @@ defmodule SymphonyElixir.StatusDashboard do
       " " <>
       colorize("next=#{next_action}", @ansi_gray) <>
       error
+  end
+
+  defp format_recent_external_finalization_rows(recent_external_finalizations) do
+    if recent_external_finalizations == [] do
+      ["│  " <> colorize("No recent external finalizations", @ansi_gray)]
+    else
+      recent_external_finalizations
+      |> Enum.sort_by(&recent_external_finalization_sort_key/1)
+      |> Enum.map(&format_recent_external_finalization_summary/1)
+    end
+  end
+
+  defp recent_external_finalization_sort_key(entry) do
+    finalized_at =
+      case Map.get(entry, :finalized_at) do
+        %DateTime{} = datetime -> -DateTime.to_unix(datetime, :microsecond)
+        _ -> 0
+      end
+
+    {finalized_at, Map.get(entry, :identifier) || Map.get(entry, :issue_id) || ""}
+  end
+
+  defp format_recent_external_finalization_summary(entry) do
+    issue_id = Map.get(entry, :issue_id) || "unknown"
+    identifier = Map.get(entry, :identifier) || issue_id
+    provider = Map.get(entry, :provider) || "external"
+    change_request_id = Map.get(entry, :change_request_id) || "unknown"
+    cr_status = Map.get(entry, :cr_status) || "unknown"
+    revision = Map.get(entry, :revision) || "n/a"
+    target_state = Map.get(entry, :target_state) || "unknown"
+    reason = format_external_value(Map.get(entry, :reason) || "unknown")
+    cleanup = format_external_value(Map.get(entry, :workspace_cleanup) || "unknown")
+    finalized_at = format_external_checked_at(Map.get(entry, :finalized_at))
+
+    "│  " <>
+      colorize("✓", @ansi_green) <>
+      " " <>
+      colorize("#{identifier}", @ansi_green) <>
+      " " <>
+      colorize("#{provider}##{change_request_id}", @ansi_yellow) <>
+      " " <>
+      colorize("cr=#{cr_status}", @ansi_green) <>
+      " " <>
+      colorize("revision=#{revision}", @ansi_cyan) <>
+      " " <>
+      colorize("target=#{target_state}", @ansi_magenta) <>
+      " " <>
+      colorize("reason=#{reason}", @ansi_gray) <>
+      " " <>
+      colorize("cleanup=#{cleanup}", @ansi_gray) <>
+      " " <>
+      colorize("at=#{finalized_at}", @ansi_gray)
   end
 
   defp format_external_checked_at(%DateTime{} = datetime), do: format_timestamp(datetime)
@@ -1476,6 +1651,41 @@ defmodule SymphonyElixir.StatusDashboard do
     end
   end
 
+  defp humanize_codex_method("antigravity_cli/event/log", payload) do
+    text =
+      map_path(payload, ["params", "text"]) ||
+        map_path(payload, [:params, :text]) ||
+        map_path(payload, ["params", "text_preview"]) ||
+        map_path(payload, [:params, :text_preview])
+
+    if is_binary(text) and String.trim(text) != "" do
+      "antigravity cli log: #{inline_text(text)}"
+    else
+      "antigravity cli log updated"
+    end
+  end
+
+  defp humanize_codex_method("antigravity_cli/event/stdout", payload) do
+    text_bytes =
+      map_path(payload, ["params", "text_bytes"]) ||
+        map_path(payload, [:params, :text_bytes])
+
+    stderr_bytes =
+      map_path(payload, ["params", "stderr_bytes"]) ||
+        map_path(payload, [:params, :stderr_bytes])
+
+    cond do
+      is_integer(text_bytes) and is_integer(stderr_bytes) and stderr_bytes > 0 ->
+        "antigravity cli stdout captured (#{text_bytes} bytes, stderr #{stderr_bytes} bytes)"
+
+      is_integer(text_bytes) ->
+        "antigravity cli stdout captured (#{text_bytes} bytes)"
+
+      true ->
+        "antigravity cli stdout captured"
+    end
+  end
+
   defp humanize_codex_method(<<"codex/event/", suffix::binary>>, payload) do
     humanize_codex_wrapper_event(suffix, payload)
   end
@@ -2024,6 +2234,10 @@ defmodule SymphonyElixir.StatusDashboard do
     else
       true
     end
+  end
+
+  defp terminal_dashboard_enabled?(observability) do
+    observability.dashboard_enabled and observability.terminal_dashboard_enabled and dashboard_enabled?()
   end
 
   defp keyword_override(opts, key) do

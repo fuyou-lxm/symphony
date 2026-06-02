@@ -101,6 +101,231 @@ defmodule SymphonyElixir.OrchestratorStatusTest do
            }
   end
 
+  test "orchestrator snapshot stores compact Antigravity CLI stdout updates" do
+    issue_id = "issue-antigravity-stdout"
+
+    issue = %Issue{
+      id: issue_id,
+      identifier: "MT-AGY",
+      title: "Compact stdout",
+      description: "Avoid keeping full CLI stdout in status state",
+      state: "In Progress",
+      url: "https://example.org/issues/MT-AGY"
+    }
+
+    orchestrator_name = Module.concat(__MODULE__, :CompactAntigravityOrchestrator)
+    {:ok, pid} = Orchestrator.start_link(name: orchestrator_name)
+
+    on_exit(fn ->
+      if Process.alive?(pid) do
+        Process.exit(pid, :normal)
+      end
+    end)
+
+    started_at = DateTime.utc_now()
+
+    running_entry = %{
+      pid: self(),
+      ref: make_ref(),
+      identifier: issue.identifier,
+      issue: issue,
+      session_id: nil,
+      turn_count: 0,
+      last_codex_message: nil,
+      last_codex_timestamp: nil,
+      last_codex_event: nil,
+      started_at: started_at
+    }
+
+    :sys.replace_state(pid, fn state ->
+      %{state | running: %{issue_id => running_entry}, claimed: MapSet.put(state.claimed, issue_id)}
+    end)
+
+    large_stdout = String.duplicate("0123456789", 2_000)
+    now = DateTime.utc_now()
+
+    send(
+      pid,
+      {:codex_worker_update, issue_id,
+       %{
+         event: :notification,
+         payload: %{
+           "method" => "antigravity_cli/event/stdout",
+           "params" => %{
+             "text" => large_stdout,
+             "stderr" => "",
+             "log_file" => "/tmp/agy.log",
+             "conversation_id" => "agy-conversation"
+           }
+         },
+         raw: large_stdout,
+         timestamp: now
+       }}
+    )
+
+    snapshot = GenServer.call(pid, :snapshot)
+    assert %{running: [snapshot_entry]} = snapshot
+    assert snapshot_entry.last_codex_timestamp == now
+    refute inspect(snapshot_entry.last_codex_message) =~ large_stdout
+
+    assert snapshot_entry.last_codex_message == %{
+             event: :notification,
+             message: %{
+               "method" => "antigravity_cli/event/stdout",
+               "params" => %{
+                 "conversation_id" => "agy-conversation",
+                 "log_file" => "/tmp/agy.log",
+                 "stderr_bytes" => 0,
+                 "text_bytes" => byte_size(large_stdout)
+               }
+             },
+             timestamp: now
+           }
+  end
+
+  test "orchestrator snapshot preserves Antigravity CLI reported byte counts" do
+    issue_id = "issue-antigravity-reported-bytes"
+
+    issue = %Issue{
+      id: issue_id,
+      identifier: "MT-AGY-BYTES",
+      title: "Preserve byte counts",
+      description: "Keep provider-reported total bytes after dropping bounded text",
+      state: "In Progress",
+      url: "https://example.org/issues/MT-AGY-BYTES"
+    }
+
+    orchestrator_name = Module.concat(__MODULE__, :PreserveAntigravityBytesOrchestrator)
+    {:ok, pid} = Orchestrator.start_link(name: orchestrator_name)
+
+    on_exit(fn ->
+      if Process.alive?(pid) do
+        Process.exit(pid, :normal)
+      end
+    end)
+
+    running_entry = %{
+      pid: self(),
+      ref: make_ref(),
+      identifier: issue.identifier,
+      issue: issue,
+      session_id: nil,
+      turn_count: 0,
+      last_codex_message: nil,
+      last_codex_timestamp: nil,
+      last_codex_event: nil,
+      started_at: DateTime.utc_now()
+    }
+
+    :sys.replace_state(pid, fn state ->
+      %{state | running: %{issue_id => running_entry}, claimed: MapSet.put(state.claimed, issue_id)}
+    end)
+
+    now = DateTime.utc_now()
+
+    send(
+      pid,
+      {:codex_worker_update, issue_id,
+       %{
+         event: :notification,
+         payload: %{
+           "method" => "antigravity_cli/event/stdout",
+           "params" => %{
+             "text" => "bounded stdout tail",
+             "stderr" => "",
+             "text_bytes" => 8_000_000,
+             "stderr_bytes" => 32,
+             "log_file" => "/tmp/agy.log",
+             "conversation_id" => "agy-conversation"
+           }
+         },
+         raw: "bounded stdout tail",
+         timestamp: now
+       }}
+    )
+
+    snapshot = GenServer.call(pid, :snapshot)
+    assert %{running: [snapshot_entry]} = snapshot
+    params = get_in(snapshot_entry.last_codex_message, [:message, "params"])
+    assert params["text_bytes"] == 8_000_000
+    assert params["stderr_bytes"] == 32
+    refute Map.has_key?(params, "text")
+    refute Map.has_key?(params, "stderr")
+  end
+
+  test "orchestrator snapshot stores compact Antigravity CLI log updates" do
+    issue_id = "issue-antigravity-log"
+
+    issue = %Issue{
+      id: issue_id,
+      identifier: "MT-AGY-LOG",
+      title: "Compact log",
+      description: "Avoid keeping full CLI log chunks in status state",
+      state: "In Progress",
+      url: "https://example.org/issues/MT-AGY-LOG"
+    }
+
+    orchestrator_name = Module.concat(__MODULE__, :CompactAntigravityLogOrchestrator)
+    {:ok, pid} = Orchestrator.start_link(name: orchestrator_name)
+
+    on_exit(fn ->
+      if Process.alive?(pid) do
+        Process.exit(pid, :normal)
+      end
+    end)
+
+    started_at = DateTime.utc_now()
+
+    running_entry = %{
+      pid: self(),
+      ref: make_ref(),
+      identifier: issue.identifier,
+      issue: issue,
+      session_id: nil,
+      turn_count: 0,
+      last_codex_message: nil,
+      last_codex_timestamp: nil,
+      last_codex_event: nil,
+      started_at: started_at
+    }
+
+    :sys.replace_state(pid, fn state ->
+      %{state | running: %{issue_id => running_entry}, claimed: MapSet.put(state.claimed, issue_id)}
+    end)
+
+    large_log = "I0601 printmode.go:71] " <> String.duplicate("log-line ", 2_000)
+    now = DateTime.utc_now()
+
+    send(
+      pid,
+      {:codex_worker_update, issue_id,
+       %{
+         event: :notification,
+         payload: %{
+           "method" => "antigravity_cli/event/log",
+           "params" => %{
+             "text" => large_log,
+             "log_file" => "/tmp/agy.log",
+             "turn_id" => "agy-turn-1",
+             "conversation_id" => "agy-conversation"
+           }
+         },
+         raw: large_log,
+         timestamp: now
+       }}
+    )
+
+    snapshot = GenServer.call(pid, :snapshot)
+    assert %{running: [snapshot_entry]} = snapshot
+    refute inspect(snapshot_entry.last_codex_message) =~ large_log
+
+    assert get_in(snapshot_entry.last_codex_message, [:message, "params", "text_bytes"]) ==
+             byte_size(large_log)
+
+    assert get_in(snapshot_entry.last_codex_message, [:message, "params", "text_preview"]) =~
+             "I0601 printmode.go:71]"
+  end
+
   test "orchestrator snapshot tracks codex thread totals and app-server pid" do
     issue_id = "issue-usage-snapshot"
 
@@ -1347,6 +1572,65 @@ defmodule SymphonyElixir.OrchestratorStatusTest do
     refute_receive {:render, _third_render_ms, _content}, 60
   end
 
+  test "status dashboard coalesces refresh notifications before mailbox growth" do
+    dashboard_name = Module.concat(__MODULE__, :CoalescedStatusDashboard)
+
+    {:ok, pid} =
+      StatusDashboard.start_link(
+        name: dashboard_name,
+        enabled: true,
+        refresh_ms: 60_000,
+        render_interval_ms: 1_000,
+        render_fun: fn _content -> :ok end
+      )
+
+    on_exit(fn ->
+      if Process.alive?(pid) do
+        :sys.resume(pid)
+        Process.exit(pid, :normal)
+      end
+    end)
+
+    :sys.suspend(pid)
+
+    for _ <- 1..200 do
+      StatusDashboard.notify_update(dashboard_name)
+    end
+
+    assert {:message_queue_len, message_queue_len} = Process.info(pid, :message_queue_len)
+    assert message_queue_len <= 1
+  end
+
+  test "status dashboard can disable terminal rendering without disabling observability config" do
+    dashboard_name = Module.concat(__MODULE__, :DisabledTerminalDashboard)
+    parent = self()
+
+    write_workflow_file!(Workflow.workflow_file_path(),
+      observability_enabled: true,
+      observability_terminal_dashboard_enabled: false
+    )
+
+    {:ok, pid} =
+      StatusDashboard.start_link(
+        name: dashboard_name,
+        refresh_ms: 60_000,
+        render_fun: fn content ->
+          send(parent, {:render, content})
+        end
+      )
+
+    on_exit(fn ->
+      if Process.alive?(pid) do
+        Process.exit(pid, :normal)
+      end
+    end)
+
+    StatusDashboard.notify_update(dashboard_name)
+    refute_receive {:render, _content}, 100
+    assert Config.settings!().observability.dashboard_enabled == true
+    assert Config.settings!().observability.terminal_dashboard_enabled == false
+  end
+
   test "status dashboard computes rolling 5-second token throughput" do
     assert StatusDashboard.rolling_tps([], 10_000, 0) == 0.0
 
@@ -1637,6 +1921,52 @@ defmodule SymphonyElixir.OrchestratorStatusTest do
     }
 
     assert StatusDashboard.humanize_codex_message(message) == "git status --short"
+  end
+
+  test "status dashboard summarizes Antigravity CLI log activity" do
+    message = %{
+      event: :notification,
+      message: %{
+        payload: %{
+          "method" => "antigravity_cli/event/log",
+          "params" => %{"text" => "I0601 printmode.go:71] Print mode: starting\n"}
+        }
+      }
+    }
+
+    assert StatusDashboard.humanize_codex_message(message) ==
+             "antigravity cli log: I0601 printmode.go:71] Print mode: starting"
+  end
+
+  test "status dashboard summarizes compact Antigravity CLI activity" do
+    log_message = %{
+      event: :notification,
+      message: %{
+        payload: %{
+          "method" => "antigravity_cli/event/log",
+          "params" => %{
+            "text_preview" => "I0601 printmode.go:71] Print mode: starting",
+            "text_bytes" => 32_000
+          }
+        }
+      }
+    }
+
+    stdout_message = %{
+      event: :notification,
+      message: %{
+        payload: %{
+          "method" => "antigravity_cli/event/stdout",
+          "params" => %{"text_bytes" => 64_000, "stderr_bytes" => 12}
+        }
+      }
+    }
+
+    assert StatusDashboard.humanize_codex_message(log_message) ==
+             "antigravity cli log: I0601 printmode.go:71] Print mode: starting"
+
+    assert StatusDashboard.humanize_codex_message(stdout_message) ==
+             "antigravity cli stdout captured (64000 bytes, stderr 12 bytes)"
   end
 
   test "status dashboard formats auto-approval updates from codex" do

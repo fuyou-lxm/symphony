@@ -7,11 +7,12 @@ defmodule SymphonyElixir.Orchestrator do
   require Logger
   import Bitwise, only: [<<<: 2]
 
-  alias SymphonyElixir.{AgentRunner, Config, ExternalMergeWatcher, StatusDashboard, Tracker, Workspace}
+  alias SymphonyElixir.{AgentRunner, CodexUpdateCompactor, Config, ExternalMergeWatcher, ProcessMemory, StatusDashboard, Tracker, Workspace}
   alias SymphonyElixir.Linear.Issue
 
   @continuation_retry_delay_ms 1_000
   @failure_retry_base_ms 10_000
+  @recent_external_finalization_retention_seconds 10 * 60
   # Slightly above the dashboard render interval so "checking now…" can render.
   @poll_transition_render_delay_ms 20
   @empty_codex_totals %{
@@ -33,12 +34,15 @@ defmodule SymphonyElixir.Orchestrator do
       :poll_check_in_progress,
       :tick_timer_ref,
       :tick_token,
+      :memory_watchdog_timer_ref,
+      :memory_watchdog_token,
       running: %{},
       completed: MapSet.new(),
       claimed: MapSet.new(),
       blocked: %{},
       external_waiting: %{},
       external_observations: %{},
+      recent_external_finalizations: %{},
       retry_attempts: %{},
       codex_totals: nil,
       codex_rate_limits: nil
@@ -63,12 +67,15 @@ defmodule SymphonyElixir.Orchestrator do
       poll_check_in_progress: false,
       tick_timer_ref: nil,
       tick_token: nil,
+      memory_watchdog_timer_ref: nil,
+      memory_watchdog_token: nil,
       codex_totals: @empty_codex_totals,
       codex_rate_limits: nil
     }
 
     run_terminal_workspace_cleanup()
     state = schedule_tick(state, 0)
+    state = ensure_memory_watchdog(state)
 
     {:ok, state}
   end
@@ -76,7 +83,10 @@ defmodule SymphonyElixir.Orchestrator do
   @impl true
   def handle_info({:tick, tick_token}, %{tick_token: tick_token} = state)
       when is_reference(tick_token) do
-    state = refresh_runtime_config(state)
+    state =
+      state
+      |> refresh_runtime_config()
+      |> prune_recent_external_finalizations()
 
     state = %{
       state
@@ -94,7 +104,10 @@ defmodule SymphonyElixir.Orchestrator do
   def handle_info({:tick, _tick_token}, state), do: {:noreply, state}
 
   def handle_info(:tick, state) do
-    state = refresh_runtime_config(state)
+    state =
+      state
+      |> refresh_runtime_config()
+      |> prune_recent_external_finalizations()
 
     state = %{
       state
@@ -110,14 +123,39 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   def handle_info(:run_poll_cycle, state) do
-    state = refresh_runtime_config(state)
+    state =
+      state
+      |> refresh_runtime_config()
+      |> prune_recent_external_finalizations()
+
     state = maybe_dispatch(state)
     state = schedule_tick(state, state.poll_interval_ms)
+    state = ensure_memory_watchdog(state)
     state = %{state | poll_check_in_progress: false}
 
     notify_dashboard()
     {:noreply, state}
   end
+
+  def handle_info({:memory_watchdog, watchdog_token}, %{memory_watchdog_token: watchdog_token} = state)
+      when is_reference(watchdog_token) do
+    before_running_count = map_size(state.running)
+    before_retry_count = map_size(state.retry_attempts)
+
+    state =
+      state
+      |> refresh_runtime_config()
+      |> reconcile_process_memory_pressure()
+      |> schedule_memory_watchdog()
+
+    if memory_watchdog_changed_state?(state, before_running_count, before_retry_count) do
+      notify_dashboard()
+    end
+
+    {:noreply, state}
+  end
+
+  def handle_info({:memory_watchdog, _watchdog_token}, state), do: {:noreply, state}
 
   def handle_info(
         {:DOWN, ref, :process, _pid, reason},
@@ -264,7 +302,7 @@ defmodule SymphonyElixir.Orchestrator do
          {:ok, issues} <- Tracker.fetch_candidate_issues() do
       state = track_external_waiting_candidates(issues, state)
 
-      if available_slots(state) > 0 do
+      if available_slots(state) > 0 and dispatch_memory_available?(state) do
         choose_issues(issues, state)
       else
         state
@@ -311,7 +349,11 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   defp reconcile_running_issues(%State{} = state) do
-    state = reconcile_stalled_running_issues(state)
+    state =
+      state
+      |> reconcile_process_memory_pressure()
+      |> reconcile_stalled_running_issues()
+
     running_ids = Map.keys(state.running)
 
     if running_ids == [] do
@@ -786,8 +828,11 @@ defmodule SymphonyElixir.Orchestrator do
   defp finalize_external_waiting_issue(%State{} = state, issue_id, metadata, {:ok, target_state, reason}) do
     case record_external_finalization(issue_id, metadata, target_state, reason) do
       :ok ->
+        {state, workspace_cleanup} = cleanup_external_waiting_workspace(state, issue_id)
+
         state
         |> put_external_observation(issue_id, external_metadata_observed_key(metadata))
+        |> record_recent_external_finalization(issue_id, metadata, target_state, reason, workspace_cleanup)
         |> release_external_waiting_issue(issue_id)
         |> record_completed_external_issue(issue_id, target_state)
 
@@ -808,6 +853,55 @@ defmodule SymphonyElixir.Orchestrator do
 
   defp record_completed_external_issue(%State{} = state, issue_id, _target_state) do
     Map.update!(state, :completed, &MapSet.delete(&1, issue_id))
+  end
+
+  defp cleanup_external_waiting_workspace(%State{} = state, issue_id) when is_binary(issue_id) do
+    case Map.get(state.external_waiting, issue_id) do
+      %{identifier: identifier} = entry when is_binary(identifier) ->
+        worker_host = Map.get(entry, :worker_host)
+        cleanup_issue_workspace(identifier, worker_host)
+        {state, :ok}
+
+      _ ->
+        {state, :skipped}
+    end
+  end
+
+  defp record_recent_external_finalization(
+         %State{} = state,
+         issue_id,
+         metadata,
+         target_state,
+         reason,
+         workspace_cleanup
+       )
+       when is_binary(issue_id) and is_map(metadata) do
+    entry = Map.get(state.external_waiting, issue_id, %{})
+    issue = Map.get(entry, :issue)
+    provider = external_metadata_value(metadata, :provider) || Map.get(entry, :provider)
+    cr_status = external_metadata_value(metadata, :to_state) || external_metadata_value(metadata, :status) || Map.get(entry, :cr_status)
+
+    finalization = %{
+      issue_id: issue_id,
+      identifier: Map.get(entry, :identifier) || external_metadata_value(metadata, :identifier) || issue_id,
+      issue: issue,
+      state: external_waiting_issue_state(entry),
+      provider: provider,
+      change_request_id: external_metadata_value(metadata, :change_request_id) || Map.get(entry, :change_request_id),
+      cr_status: cr_status,
+      revision: external_metadata_value(metadata, :revision) || Map.get(entry, :revision),
+      observed_key: external_metadata_value(metadata, :observed_key) || Map.get(entry, :observed_key),
+      target_state: target_state,
+      reason: reason,
+      token_policy: Map.get(entry, :token_policy) || :no_codex,
+      workspace_cleanup: workspace_cleanup,
+      worker_host: Map.get(entry, :worker_host),
+      workspace_path: Map.get(entry, :workspace_path),
+      finalized_at: DateTime.utc_now(),
+      url: external_metadata_value(metadata, :url) || Map.get(entry, :url)
+    }
+
+    %{state | recent_external_finalizations: Map.put(state.recent_external_finalizations, issue_id, finalization)}
   end
 
   defp external_final_state(outcome) when outcome in [:merged, "merged"], do: {:ok, "Done", :external_merged}
@@ -893,6 +987,23 @@ defmodule SymphonyElixir.Orchestrator do
     }
   end
 
+  defp prune_recent_external_finalizations(%State{} = state) do
+    now = DateTime.utc_now()
+
+    recent =
+      state.recent_external_finalizations
+      |> Enum.reject(fn
+        {_issue_id, %{finalized_at: %DateTime{} = finalized_at}} ->
+          DateTime.diff(now, finalized_at, :second) > @recent_external_finalization_retention_seconds
+
+        _entry ->
+          false
+      end)
+      |> Map.new()
+
+    %{state | recent_external_finalizations: recent}
+  end
+
   defp external_merge_watcher_module do
     Application.get_env(:symphony_elixir, :external_merge_watcher, ExternalMergeWatcher)
   end
@@ -926,6 +1037,63 @@ defmodule SymphonyElixir.Orchestrator do
         release_issue_claim(state, issue_id)
     end
   end
+
+  defp reconcile_process_memory_pressure(%State{running: running} = state) when map_size(running) > 0 do
+    config = Config.settings!()
+    limit = config.agent.max_process_tree_rss_bytes
+
+    if is_integer(limit) and limit > 0 do
+      case process_tree_memory() do
+        %{rss_bytes: rss_bytes, process_count: process_count}
+        when is_integer(rss_bytes) and rss_bytes >= limit ->
+          stop_oldest_running_issue_for_memory_pressure(state, rss_bytes, limit, process_count)
+
+        _ ->
+          state
+      end
+    else
+      state
+    end
+  end
+
+  defp reconcile_process_memory_pressure(%State{} = state), do: state
+
+  defp stop_oldest_running_issue_for_memory_pressure(%State{} = state, rss_bytes, limit, process_count) do
+    case oldest_running_issue(state.running) do
+      {issue_id, running_entry} ->
+        identifier = Map.get(running_entry, :identifier, issue_id)
+        session_id = running_entry_session_id(running_entry)
+
+        Logger.warning(
+          "Stopping oldest running issue for memory pressure: issue_id=#{issue_id} issue_identifier=#{identifier} session_id=#{session_id} rss_bytes=#{rss_bytes} process_count=#{process_count} limit_bytes=#{limit}"
+        )
+
+        next_attempt = next_retry_attempt_from_running(running_entry)
+
+        state
+        |> terminate_running_issue(issue_id, false)
+        |> schedule_issue_retry(issue_id, next_attempt || 1, %{
+          identifier: identifier,
+          error: "process tree memory limit exceeded: #{rss_bytes} bytes >= #{limit} bytes",
+          worker_host: Map.get(running_entry, :worker_host),
+          workspace_path: Map.get(running_entry, :workspace_path)
+        })
+
+      nil ->
+        state
+    end
+  end
+
+  defp oldest_running_issue(running) when is_map(running) do
+    running
+    |> Enum.sort_by(fn {issue_id, running_entry} ->
+      {started_at_sort_key(Map.get(running_entry, :started_at)), issue_id}
+    end)
+    |> List.first()
+  end
+
+  defp started_at_sort_key(%DateTime{} = datetime), do: DateTime.to_unix(datetime, :microsecond)
+  defp started_at_sort_key(_started_at), do: 0
 
   defp reconcile_stalled_running_issues(%State{} = state) do
     timeout_ms = Config.settings!().codex.stall_timeout_ms
@@ -1177,6 +1345,7 @@ defmodule SymphonyElixir.Orchestrator do
 
   defp put_external_waiting_issue(%State{} = state, %Issue{} = issue) do
     Logger.info("Tracking external-waiting no-auto-Codex issue: #{issue_context(issue)} state=#{issue.state}")
+    Workspace.run_after_external_waiting_start_hook_for_issue(issue)
 
     waiting_entry = %{
       issue_id: issue.id,
@@ -1206,6 +1375,14 @@ defmodule SymphonyElixir.Orchestrator do
   defp move_blocked_issue_to_external_waiting(%State{} = state, %Issue{} = issue) do
     blocked_entry = Map.get(state.blocked, issue.id, %{})
     existing_entry = Map.get(state.external_waiting, issue.id, %{})
+    worker_host = Map.get(existing_entry, :worker_host) || Map.get(blocked_entry, :worker_host)
+    workspace_path = Map.get(existing_entry, :workspace_path) || Map.get(blocked_entry, :workspace_path)
+
+    if workspace_path do
+      Workspace.run_after_external_waiting_start_hook(workspace_path, issue, worker_host)
+    else
+      Workspace.run_after_external_waiting_start_hook_for_issue(issue, worker_host)
+    end
 
     waiting_entry =
       Map.merge(
@@ -1219,6 +1396,8 @@ defmodule SymphonyElixir.Orchestrator do
           revision: Map.get(existing_entry, :revision),
           observed_key: Map.get(state.external_observations, issue.id) || Map.get(existing_entry, :observed_key),
           token_policy: :no_codex,
+          worker_host: worker_host,
+          workspace_path: workspace_path,
           next_action: :wait,
           error: nil,
           waiting_since: Map.get(existing_entry, :waiting_since) || Map.get(blocked_entry, :blocked_at) || DateTime.utc_now(),
@@ -1233,6 +1412,8 @@ defmodule SymphonyElixir.Orchestrator do
         identifier: issue.identifier || Map.get(blocked_entry, :identifier) || issue.id,
         issue: issue,
         token_policy: :no_codex,
+        worker_host: worker_host,
+        workspace_path: workspace_path,
         next_action: :wait
       })
 
@@ -1247,16 +1428,91 @@ defmodule SymphonyElixir.Orchestrator do
   defp choose_issues(issues, state) do
     active_states = active_state_set()
     terminal_states = terminal_state_set()
+    memory_budget = dispatch_memory_budget(state)
 
-    issues
-    |> sort_issues_for_dispatch()
-    |> Enum.reduce(state, fn issue, state_acc ->
-      if should_dispatch_issue?(issue, state_acc, active_states, terminal_states) do
-        dispatch_issue(state_acc, issue)
-      else
-        state_acc
+    {state, _memory_budget} =
+      issues
+      |> sort_issues_for_dispatch()
+      |> Enum.reduce({state, memory_budget}, fn issue, {state_acc, memory_budget_acc} ->
+        cond do
+          not should_dispatch_issue?(issue, state_acc, active_states, terminal_states) ->
+            {state_acc, memory_budget_acc}
+
+          not dispatch_memory_budget_available?(memory_budget_acc) ->
+            log_dispatch_memory_budget_exhausted(memory_budget_acc)
+            {state_acc, memory_budget_acc}
+
+          true ->
+            {dispatch_issue(state_acc, issue), reserve_dispatch_memory(memory_budget_acc)}
+        end
+      end)
+
+    state
+  end
+
+  defp dispatch_memory_budget(%State{} = _state) do
+    config = Config.settings!()
+    limit = config.agent.max_process_tree_rss_bytes
+    reservation = config.agent.dispatch_rss_reservation_bytes
+
+    if is_integer(limit) and limit > 0 and is_integer(reservation) and reservation > 0 do
+      case process_tree_memory() do
+        %{rss_bytes: rss_bytes} when is_integer(rss_bytes) ->
+          %{available_bytes: max(limit - rss_bytes, 0), reservation_bytes: reservation}
+
+        _ ->
+          :unlimited
       end
-    end)
+    else
+      :unlimited
+    end
+  end
+
+  defp dispatch_memory_budget_available?(:unlimited), do: true
+
+  defp dispatch_memory_budget_available?(%{available_bytes: available_bytes, reservation_bytes: reservation_bytes})
+       when is_integer(available_bytes) and is_integer(reservation_bytes) do
+    available_bytes >= reservation_bytes
+  end
+
+  defp dispatch_memory_budget_available?(_memory_budget), do: true
+
+  defp reserve_dispatch_memory(:unlimited), do: :unlimited
+
+  defp reserve_dispatch_memory(%{available_bytes: available_bytes, reservation_bytes: reservation_bytes} = memory_budget)
+       when is_integer(available_bytes) and is_integer(reservation_bytes) do
+    %{memory_budget | available_bytes: max(available_bytes - reservation_bytes, 0)}
+  end
+
+  defp reserve_dispatch_memory(memory_budget), do: memory_budget
+
+  defp log_dispatch_memory_budget_exhausted(%{available_bytes: available_bytes, reservation_bytes: reservation_bytes}) do
+    Logger.warning("Skipping additional agent dispatch because remaining process tree RSS budget is #{available_bytes} bytes, below per-dispatch reservation #{reservation_bytes} bytes")
+  end
+
+  defp log_dispatch_memory_budget_exhausted(_memory_budget), do: :ok
+
+  defp dispatch_memory_available?(%State{} = _state) do
+    case Config.settings!().agent.max_process_tree_rss_bytes do
+      limit when is_integer(limit) and limit > 0 ->
+        case process_tree_memory() do
+          %{rss_bytes: rss_bytes, process_count: process_count}
+          when is_integer(rss_bytes) and rss_bytes >= limit ->
+            Logger.warning("Skipping new agent dispatch because Symphony process RSS is #{rss_bytes} bytes across #{process_count} processes, exceeding configured limit #{limit} bytes")
+
+            false
+
+          _ ->
+            true
+        end
+
+      _ ->
+        true
+    end
+  end
+
+  defp process_tree_memory do
+    ProcessMemory.current_process_tree_memory()
   end
 
   defp sort_issues_for_dispatch(issues) when is_list(issues) do
@@ -1281,7 +1537,7 @@ defmodule SymphonyElixir.Orchestrator do
 
   defp should_dispatch_issue?(
          %Issue{} = issue,
-         %State{running: running, claimed: claimed, blocked: blocked} = state,
+         %State{running: running, claimed: claimed, retry_attempts: retry_attempts, blocked: blocked} = state,
          active_states,
          terminal_states
        ) do
@@ -1290,6 +1546,7 @@ defmodule SymphonyElixir.Orchestrator do
       !todo_issue_blocked_by_non_terminal?(issue, terminal_states) and
       !MapSet.member?(claimed, issue.id) and
       !Map.has_key?(running, issue.id) and
+      !Map.has_key?(retry_attempts, issue.id) and
       !Map.has_key?(blocked, issue.id) and
       available_slots(state) > 0 and
       state_slots_available?(issue, running) and
@@ -1969,9 +2226,27 @@ defmodule SymphonyElixir.Orchestrator do
     end
   end
 
+  @spec counts_snapshot(GenServer.server(), timeout()) :: map() | :timeout | :unavailable
+  def counts_snapshot(server \\ __MODULE__, timeout \\ 15_000) do
+    if Process.whereis(server) do
+      try do
+        GenServer.call(server, :counts_snapshot, timeout)
+      catch
+        :exit, {:timeout, _} -> :timeout
+        :exit, _ -> :unavailable
+      end
+    else
+      :unavailable
+    end
+  end
+
   @impl true
   def handle_call(:snapshot, _from, state) do
-    state = refresh_runtime_config(state)
+    state =
+      state
+      |> refresh_runtime_config()
+      |> prune_recent_external_finalizations()
+
     now = DateTime.utc_now()
     now_ms = System.monotonic_time(:millisecond)
 
@@ -2051,12 +2326,36 @@ defmodule SymphonyElixir.Orchestrator do
         }
       end)
 
+    recent_external_finalizations =
+      state.recent_external_finalizations
+      |> Enum.map(fn {issue_id, metadata} ->
+        %{
+          issue_id: issue_id,
+          identifier: Map.get(metadata, :identifier),
+          state: external_waiting_issue_state(metadata),
+          provider: Map.get(metadata, :provider),
+          change_request_id: Map.get(metadata, :change_request_id),
+          cr_status: Map.get(metadata, :cr_status),
+          revision: Map.get(metadata, :revision),
+          observed_key: Map.get(metadata, :observed_key),
+          target_state: Map.get(metadata, :target_state),
+          reason: Map.get(metadata, :reason),
+          token_policy: Map.get(metadata, :token_policy),
+          workspace_cleanup: Map.get(metadata, :workspace_cleanup),
+          worker_host: Map.get(metadata, :worker_host),
+          workspace_path: Map.get(metadata, :workspace_path),
+          finalized_at: Map.get(metadata, :finalized_at),
+          url: Map.get(metadata, :url)
+        }
+      end)
+
     {:reply,
      %{
        running: running,
        retrying: retrying,
        blocked: blocked,
        external_waiting: external_waiting,
+       recent_external_finalizations: recent_external_finalizations,
        codex_totals: state.codex_totals,
        rate_limits: Map.get(state, :codex_rate_limits),
        polling: %{
@@ -2064,6 +2363,24 @@ defmodule SymphonyElixir.Orchestrator do
          next_poll_in_ms: next_poll_in_ms(state.next_poll_due_at_ms, now_ms),
          poll_interval_ms: state.poll_interval_ms
        }
+     }, state}
+  end
+
+  def handle_call(:counts_snapshot, _from, state) do
+    state =
+      state
+      |> refresh_runtime_config()
+      |> prune_recent_external_finalizations()
+
+    {:reply,
+     %{
+       counts: %{
+         running: map_size(state.running),
+         retrying: map_size(state.retry_attempts),
+         blocked: map_size(state.blocked),
+         external_waiting: map_size(state.external_waiting)
+       },
+       running_preview_workspaces: running_preview_workspaces(state.running)
      }, state}
   end
 
@@ -2082,15 +2399,23 @@ defmodule SymphonyElixir.Orchestrator do
      }, state}
   end
 
+  def handle_call({:manual_resume, issue_id}, _from, state) when is_binary(issue_id) do
+    {reply, state} = wake_blocked_issue_for_manual_resume(state, issue_id)
+    {:reply, reply, state}
+  end
+
   def handle_call({:external_state_changed, issue_id, metadata}, _from, state)
       when is_binary(issue_id) and is_map(metadata) do
     {reply, state} = handle_external_state_changed(state, issue_id, metadata)
     {:reply, reply, state}
   end
 
-  def handle_call({:manual_resume, issue_id}, _from, state) when is_binary(issue_id) do
-    {reply, state} = wake_blocked_issue_for_manual_resume(state, issue_id)
-    {:reply, reply, state}
+  defp running_preview_workspaces(running) when is_map(running) do
+    running
+    |> Map.values()
+    |> Enum.map(&Map.get(&1, :workspace_path))
+    |> Enum.filter(&(is_binary(&1) and &1 != ""))
+    |> Enum.uniq()
   end
 
   defp blocked_issue_state(%{issue: %Issue{state: state}}), do: state
@@ -2154,7 +2479,7 @@ defmodule SymphonyElixir.Orchestrator do
     {
       Map.merge(running_entry, %{
         last_codex_timestamp: timestamp,
-        last_codex_message: summarize_codex_update(update),
+        last_codex_message: CodexUpdateCompactor.summarize(update),
         session_id: session_id_for_update(running_entry.session_id, update),
         last_codex_event: event,
         codex_app_server_pid: codex_app_server_pid_for_update(codex_app_server_pid, update),
@@ -2206,14 +2531,6 @@ defmodule SymphonyElixir.Orchestrator do
 
   defp turn_count_for_update(_existing_count, _existing_session_id, _update), do: 0
 
-  defp summarize_codex_update(update) do
-    %{
-      event: update[:event],
-      message: update[:payload] || update[:raw],
-      timestamp: update[:timestamp]
-    }
-  end
-
   defp schedule_tick(%State{} = state, delay_ms) when is_integer(delay_ms) and delay_ms >= 0 do
     if is_reference(state.tick_timer_ref) do
       Process.cancel_timer(state.tick_timer_ref)
@@ -2228,6 +2545,53 @@ defmodule SymphonyElixir.Orchestrator do
         tick_token: tick_token,
         next_poll_due_at_ms: System.monotonic_time(:millisecond) + delay_ms
     }
+  end
+
+  defp schedule_memory_watchdog(%State{} = state) do
+    config = Config.settings!()
+    interval_ms = config.agent.memory_watchdog_interval_ms
+    limit = config.agent.max_process_tree_rss_bytes
+
+    if is_reference(state.memory_watchdog_timer_ref) do
+      Process.cancel_timer(state.memory_watchdog_timer_ref)
+    end
+
+    if is_integer(limit) and limit > 0 and is_integer(interval_ms) and interval_ms > 0 do
+      watchdog_token = make_ref()
+      timer_ref = Process.send_after(self(), {:memory_watchdog, watchdog_token}, interval_ms)
+
+      %{
+        state
+        | memory_watchdog_timer_ref: timer_ref,
+          memory_watchdog_token: watchdog_token
+      }
+    else
+      %{
+        state
+        | memory_watchdog_timer_ref: nil,
+          memory_watchdog_token: nil
+      }
+    end
+  end
+
+  defp ensure_memory_watchdog(%State{} = state) do
+    if memory_watchdog_configured?() and is_reference(state.memory_watchdog_timer_ref) do
+      state
+    else
+      schedule_memory_watchdog(state)
+    end
+  end
+
+  defp memory_watchdog_configured? do
+    config = Config.settings!()
+    interval_ms = config.agent.memory_watchdog_interval_ms
+    limit = config.agent.max_process_tree_rss_bytes
+
+    is_integer(limit) and limit > 0 and is_integer(interval_ms) and interval_ms > 0
+  end
+
+  defp memory_watchdog_changed_state?(%State{} = state, before_running_count, before_retry_count) do
+    map_size(state.running) != before_running_count or map_size(state.retry_attempts) != before_retry_count
   end
 
   defp schedule_poll_cycle_start do

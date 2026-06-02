@@ -124,7 +124,24 @@ Notes:
 - When `codex.turn_sandbox_policy` is set explicitly, Symphony passes the map through to Codex
   unchanged. Compatibility then depends on the targeted Codex app-server version rather than local
   Symphony validation.
-- `agent.max_turns` caps how many back-to-back Codex turns Symphony will run in a single agent
+- Set `agent.provider` to `antigravity_sdk` to run turns through the Google Antigravity Python SDK
+  bridge instead of Codex app-server. Codex remains the default provider.
+- `antigravity.python` defaults to `python3`, `antigravity.runner` defaults to
+  `priv/antigravity_sdk_runner.py`, and `antigravity.api_key` is an optional SDK override. Leave it
+  unset to let the Antigravity SDK use its default authentication environment; set
+  `antigravity.api_key: $GEMINI_API_KEY` only when you want Symphony to pass that key explicitly.
+- `antigravity.approval_policy` supports `never` and `on-request`; the SDK bridge is non-interactive
+  and emits input/approval-required events back to Symphony rather than prompting in the terminal.
+- Set `agent.provider` to `antigravity_cli` to run turns through the local `agy` CLI instead. The
+  CLI provider uses `agy --print` once per turn and wraps task prompts as `/goal <prompt>` so
+  Antigravity runs them in goal-driven mode. It passes `--add-dir <workspace>` so file edits land in
+  the issue workspace, and resumes later turns with the CLI conversation id parsed from its log. It
+  supports the CLI's local keyring/browser-login authentication. `antigravity_cli.approval_policy`
+  defaults to `never`, which passes `--dangerously-skip-permissions`; use `on-request` to omit that
+  flag. The CLI provider only reports turn-level stdout/status because `agy` does not expose Codex's
+  structured app-server event stream. `/goal` is a slash command sent through `--print`, not an
+  `agy goal` subcommand.
+- `agent.max_turns` caps how many back-to-back agent turns Symphony will run in a single agent
   invocation when a turn completes normally but the issue is still in an active state. Default: `20`.
 - If the Markdown body is blank, Symphony uses a default prompt template that includes the issue
   identifier, title, and body.
@@ -154,16 +171,59 @@ codex:
 - If a later reload fails, Symphony keeps running with the last known good workflow and logs the
   reload error until the file is fixed.
 - `server.port` or CLI `--port` enables the optional Phoenix LiveView dashboard and JSON API at
-  `/`, `/api/v1/state`, `/api/v1/<issue_identifier>`, and `/api/v1/refresh`.
+  `/`, `/api/v1/state`, `/api/v1/memory`, `/api/v1/<issue_identifier>`, and `/api/v1/refresh`.
 
 ## Web dashboard
 
 The observability UI now runs on a minimal Phoenix stack:
 
 - LiveView for the dashboard at `/`
+- Chinese dashboard copy is available with `/?lang=zh-CN`; English remains the default.
 - JSON API for operational debugging under `/api/v1/*`
 - Bandit as the HTTP server
 - Phoenix dependency static assets for the LiveView client bootstrap
+
+To capture process-tree memory evidence during a live run, sample the observability API from a
+second terminal:
+
+```bash
+cd elixir
+mise exec -- mix antigravity_cli.preflight --workflow WORKFLOW.en.powerchat-agy.md
+
+mise exec -- mix observability.memory_monitor \
+  --port 4011 \
+  --samples 3600 \
+  --interval-ms 1000 \
+  --startup-grace-ms 30000 \
+  --min-running 10 \
+  --max-rss-bytes 5368709120 \
+  --output log/antigravity-memory.ndjson \
+  --summary
+```
+
+The task samples the lightweight `/api/v1/memory` endpoint by default, so a one-second cadence only
+builds counts and process-memory diagnostics instead of the full dashboard payload. It prints one
+compact NDJSON record per sample and fails when Symphony's local process-tree RSS is greater than
+or equal to `--max-rss-bytes`, which keeps the check aligned with a strict "below 5GiB" memory
+target. Use `--min-running 10` on the same run to make the monitor fail unless it observes at least
+10 simultaneous running issues. Use `--output` for long runs so per-sample NDJSON goes to a file
+instead of terminal scrollback. Workspace preview memory is reported separately as
+`running_preview_rss_bytes` for diagnosis; it is not included in the Symphony process-tree RSS gate.
+`--startup-grace-ms 30000` lets the monitor survive a short Symphony HTTP startup race before the
+first sample; after the first successful sample, fetch failures still fail the monitor quickly.
+
+Keep `observability.state_sample_interval_ms` at `5000` or higher for large parallel runs. That
+setting controls the background full-state dashboard sampler; one-second memory monitoring should
+use `/api/v1/memory`, not repeated full `/api/v1/state` snapshots.
+
+For low-memory Antigravity CLI runs, set `agent.memory_watchdog_interval_ms: 1000` alongside the
+5GiB `agent.max_process_tree_rss_bytes` limit. The watchdog is separate from dashboard refreshes:
+it samples only Symphony's local process-tree RSS and stops the oldest running issue for retry when
+the limit is reached. This keeps the memory fuse responsive even when the normal Linear polling
+interval is several seconds.
+
+Keep `polling.interval_ms` at `5000` or higher for those runs. The poll cycle talks to the tracker
+and can dispatch work; it should not be used as the one-second memory safety loop.
 
 ## Project Layout
 

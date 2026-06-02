@@ -193,6 +193,49 @@ defmodule SymphonyElixir.Workspace do
     end
   end
 
+  @spec run_after_external_waiting_start_hook(Path.t(), map() | String.t() | nil, worker_host()) :: :ok
+  def run_after_external_waiting_start_hook(workspace, issue_or_identifier, worker_host \\ nil) when is_binary(workspace) do
+    issue_context = issue_context(issue_or_identifier)
+    hooks = Config.settings!().hooks
+
+    case hooks.after_external_waiting_start do
+      nil ->
+        :ok
+
+      command ->
+        run_hook_if_workspace_exists(command, workspace, issue_context, "after_external_waiting_start", worker_host)
+        |> ignore_hook_failure()
+    end
+  end
+
+  def run_after_external_waiting_start_hook_for_issue(issue_or_identifier, worker_host \\ nil)
+
+  @spec run_after_external_waiting_start_hook_for_issue(map() | String.t() | nil, worker_host()) :: :ok
+  def run_after_external_waiting_start_hook_for_issue(issue_or_identifier, nil) do
+    case Config.settings!().worker.ssh_hosts do
+      [] ->
+        run_after_external_waiting_start_hook_for_issue_on_worker(issue_or_identifier, nil)
+
+      worker_hosts ->
+        Enum.each(worker_hosts, &run_after_external_waiting_start_hook_for_issue_on_worker(issue_or_identifier, &1))
+        :ok
+    end
+  end
+
+  def run_after_external_waiting_start_hook_for_issue(issue_or_identifier, worker_host) when is_binary(worker_host) do
+    run_after_external_waiting_start_hook_for_issue_on_worker(issue_or_identifier, worker_host)
+  end
+
+  defp run_after_external_waiting_start_hook_for_issue_on_worker(issue_or_identifier, worker_host) do
+    issue_context = issue_context(issue_or_identifier)
+    safe_id = safe_identifier(issue_context.issue_identifier)
+
+    case workspace_path_for_issue(safe_id, worker_host) do
+      {:ok, workspace} -> run_after_external_waiting_start_hook(workspace, issue_or_identifier, worker_host)
+      {:error, _reason} -> :ok
+    end
+  end
+
   defp workspace_path_for_issue(safe_id, nil) when is_binary(safe_id) do
     Config.settings!().workspace.root
     |> Path.join(safe_id)
@@ -290,6 +333,39 @@ defmodule SymphonyElixir.Workspace do
 
   defp ignore_hook_failure(:ok), do: :ok
   defp ignore_hook_failure({:error, _reason}), do: :ok
+
+  defp run_hook_if_workspace_exists(command, workspace, issue_context, hook_name, nil) do
+    case File.dir?(workspace) do
+      true ->
+        run_hook(command, workspace, issue_context, hook_name, nil)
+
+      false ->
+        :ok
+    end
+  end
+
+  defp run_hook_if_workspace_exists(command, workspace, issue_context, hook_name, worker_host) when is_binary(worker_host) do
+    script =
+      [
+        remote_shell_assign("workspace", workspace),
+        "if [ -d \"$workspace\" ]; then",
+        "  cd \"$workspace\"",
+        "  #{command}",
+        "fi"
+      ]
+      |> Enum.join("\n")
+
+    case run_remote_command(worker_host, script, Config.settings!().hooks.timeout_ms) do
+      {:ok, cmd_result} ->
+        handle_hook_command_result(cmd_result, workspace, issue_context, hook_name)
+
+      {:error, {:workspace_hook_timeout, "remote_command", timeout_ms}} ->
+        {:error, {:workspace_hook_timeout, hook_name, timeout_ms}}
+
+      {:error, reason} ->
+        {:error, reason}
+    end
+  end
 
   defp run_hook(command, workspace, issue_context, hook_name, nil) do
     timeout_ms = Config.settings!().hooks.timeout_ms

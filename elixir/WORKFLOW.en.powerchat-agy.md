@@ -18,26 +18,263 @@ polling:
 workspace:
   root: ~/code/symphony-workspaces
 hooks:
+  timeout_ms: 600000
   after_create: |
-    git clone --depth 1 https://codeup.aliyun.com/674522743d6d6f80b4ca9da9/product/symphony-code-demo.git .
-    if [ -d elixir ]; then
-      if command -v mise >/dev/null 2>&1; then
-        (cd elixir && mise trust && mise exec -- mix deps.get)
+    set -e
+    git clone --depth 1 https://codeup.aliyun.com/674522743d6d6f80b4ca9da9/Agents/agentscope-spark-design.git .
+
+    if [ ! -f packages/spark-chat/package.json ]; then
+      echo "packages/spark-chat/package.json not found" >&2
+      exit 1
+    fi
+
+    if [ -f packages/spark-chat/package-lock.json ] && command -v npm >/dev/null 2>&1; then
+      (cd packages/spark-chat && npm ci)
+    elif command -v npm >/dev/null 2>&1; then
+      (cd packages/spark-chat && npm install)
+    else
+      echo "npm is required to prepare packages/spark-chat" >&2
+      exit 1
+    fi
+  before_run: |
+    set -e
+    WORKSPACE_ROOT=$(pwd -P)
+    mkdir -p .symphony
+    rm -f .symphony/keep_powerchat_preview
+
+    kill_tree() {
+      TARGET_PID=$1
+      if [ -z "$TARGET_PID" ]; then
+        return
       fi
-    elif [ -f package.json ]; then
-      corepack enable >/dev/null 2>&1 || true
-      if command -v pnpm >/dev/null 2>&1; then
-        pnpm install --frozen-lockfile
-      elif command -v npm >/dev/null 2>&1; then
-        npm install
+
+      for CHILD_PID in $(pgrep -P "$TARGET_PID" 2>/dev/null || true); do
+        kill_tree "$CHILD_PID"
+      done
+
+      kill "$TARGET_PID" >/dev/null 2>&1 || true
+    }
+
+    if [ -f .symphony/powerchat.pid ]; then
+      kill "$(cat .symphony/powerchat.pid)" >/dev/null 2>&1 || true
+      kill_tree "$(cat .symphony/powerchat.pid)" >/dev/null 2>&1 || true
+      rm -f .symphony/powerchat.pid
+    fi
+
+    if [ -f .symphony/powerchat.env ]; then
+      PORT=$(awk -F= '/^POWERCHAT_PORT=/{print $2}' .symphony/powerchat.env)
+      if [ -n "$PORT" ]; then
+        for LISTENER_PID in $(lsof -tiTCP:"$PORT" -sTCP:LISTEN 2>/dev/null || true); do
+          kill_tree "$LISTENER_PID"
+          sleep 1
+          kill -9 "$LISTENER_PID" >/dev/null 2>&1 || true
+        done
       fi
     fi
-  before_remove: |
-    if [ -d elixir ] && command -v mise >/dev/null 2>&1; then
-      (cd elixir && mise exec -- mix workspace.before_remove)
+
+    pgrep -f "$WORKSPACE_ROOT/packages/spark-chat/.*tailwindcss.*--watch" 2>/dev/null | while read -r TAILWIND_PID; do
+      kill_tree "$TAILWIND_PID"
+      kill -9 "$TAILWIND_PID" >/dev/null 2>&1 || true
+    done
+
+    cat > .symphony/start_powerchat_preview.sh <<'POWERCHAT_PREVIEW'
+    #!/bin/sh
+    set -e
+    WORKSPACE_ROOT=$(pwd -P)
+    mkdir -p .symphony
+    NODE_HEAP_MB="${SYMPHONY_POWERCHAT_NODE_MAX_OLD_SPACE_MB:-256}"
+
+    kill_tree() {
+      TARGET_PID=$1
+      if [ -z "$TARGET_PID" ]; then
+        return
+      fi
+
+      for CHILD_PID in $(pgrep -P "$TARGET_PID" 2>/dev/null || true); do
+        kill_tree "$CHILD_PID"
+      done
+
+      kill "$TARGET_PID" >/dev/null 2>&1 || true
+    }
+
+    if [ -f .symphony/powerchat.pid ]; then
+      PID=$(cat .symphony/powerchat.pid)
+      if kill -0 "$PID" >/dev/null 2>&1; then
+        if [ -f .symphony/powerchat.env ]; then
+          POWERCHAT_URL=$(awk -F= '/^POWERCHAT_URL=/{print $2}' .symphony/powerchat.env)
+          if [ -n "$POWERCHAT_URL" ] && curl -fsS "$POWERCHAT_URL" >/dev/null 2>&1; then
+            exit 0
+          fi
+        fi
+      fi
+      kill_tree "$PID"
+      rm -f .symphony/powerchat.pid
     fi
+
+    PORT_BASE=43000
+    PORT_RANGE=1000
+    HASH=$(printf '%s' "$PWD" | cksum | awk '{print $1}')
+    PORT=$((PORT_BASE + HASH % PORT_RANGE))
+    ATTEMPT=0
+
+    while [ "$ATTEMPT" -lt "$PORT_RANGE" ]; do
+      if ! lsof -iTCP:"$PORT" -sTCP:LISTEN >/dev/null 2>&1; then
+        break
+      fi
+
+      PORT=$((PORT + 1))
+      if [ "$PORT" -ge $((PORT_BASE + PORT_RANGE)) ]; then
+        PORT=$PORT_BASE
+      fi
+
+      ATTEMPT=$((ATTEMPT + 1))
+    done
+
+    if lsof -iTCP:"$PORT" -sTCP:LISTEN >/dev/null 2>&1; then
+      echo "No free PowerChat dev server port found" >&2
+      exit 1
+    fi
+
+    NODE_OPTIONS_VALUE="${NODE_OPTIONS:+$NODE_OPTIONS }--max-old-space-size=$NODE_HEAP_MB"
+    nohup sh -c 'tail -f /dev/null | (cd packages/spark-chat && exec env BROWSER=none CHECK_TIMEOUT=30 NODE_OPTIONS="$2" PORT="$1" npm run dev)' sh "$PORT" "$NODE_OPTIONS_VALUE" < /dev/null > "$WORKSPACE_ROOT/.symphony/powerchat.log" 2>&1 &
+    echo $! > .symphony/powerchat.pid
+
+    PID=$(cat .symphony/powerchat.pid)
+    POWERCHAT_URL="http://127.0.0.1:$PORT/spark-chat/power-chat"
+
+    for _ in $(seq 1 120); do
+      if curl -fsS "$POWERCHAT_URL" >/dev/null 2>&1; then
+        {
+          echo "POWERCHAT_PREVIEW_MODE=running"
+          echo "POWERCHAT_PORT=$PORT"
+          echo "POWERCHAT_URL=$POWERCHAT_URL"
+          echo "POWERCHAT_NODE_MAX_OLD_SPACE_MB=$NODE_HEAP_MB"
+          echo "POWERCHAT_START_COMMAND=./.symphony/start_powerchat_preview.sh"
+        } > .symphony/powerchat.env
+        exit 0
+      fi
+
+      if ! kill -0 "$PID" >/dev/null 2>&1; then
+        echo "PowerChat dev server exited before becoming ready" >&2
+        tail -80 .symphony/powerchat.log >&2 || true
+        exit 1
+      fi
+
+      sleep 1
+    done
+
+    echo "PowerChat dev server did not become ready at $POWERCHAT_URL" >&2
+    tail -80 .symphony/powerchat.log >&2 || true
+    exit 1
+    POWERCHAT_PREVIEW
+
+    chmod +x .symphony/start_powerchat_preview.sh
+
+    {
+      echo "POWERCHAT_PREVIEW_MODE=on_demand"
+      echo "POWERCHAT_NODE_MAX_OLD_SPACE_MB=${SYMPHONY_POWERCHAT_NODE_MAX_OLD_SPACE_MB:-256}"
+      echo "POWERCHAT_START_COMMAND=./.symphony/start_powerchat_preview.sh"
+    } > .symphony/powerchat.env
+
+    if [ "${SYMPHONY_POWERCHAT_AUTO_START_PREVIEW:-0}" = "1" ]; then
+      ./.symphony/start_powerchat_preview.sh
+    fi
+  after_run: |
+    if [ -f .symphony/keep_powerchat_preview ]; then
+      exit 0
+    fi
+
+    WORKSPACE_REAL=$(pwd -P)
+
+    kill_tree() {
+      TARGET_PID=$1
+      if [ -z "$TARGET_PID" ]; then
+        return
+      fi
+
+      for CHILD_PID in $(pgrep -P "$TARGET_PID" 2>/dev/null || true); do
+        kill_tree "$CHILD_PID"
+      done
+
+      kill "$TARGET_PID" >/dev/null 2>&1 || true
+    }
+
+    if [ -f .symphony/powerchat.pid ]; then
+      PID=$(cat .symphony/powerchat.pid)
+      kill_tree "$PID"
+      sleep 1
+      for CHILD_PID in $(pgrep -P "$PID" 2>/dev/null || true); do
+        kill -9 "$CHILD_PID" >/dev/null 2>&1 || true
+      done
+      kill -9 "$PID" >/dev/null 2>&1 || true
+      rm -f .symphony/powerchat.pid
+    fi
+
+    if [ -f .symphony/powerchat.env ]; then
+      PORT=$(awk -F= '/^POWERCHAT_PORT=/{print $2}' .symphony/powerchat.env)
+      if [ -n "$PORT" ]; then
+        for LISTENER_PID in $(lsof -tiTCP:"$PORT" -sTCP:LISTEN 2>/dev/null || true); do
+          kill_tree "$LISTENER_PID"
+          sleep 1
+          kill -9 "$LISTENER_PID" >/dev/null 2>&1 || true
+        done
+      fi
+    fi
+
+    pgrep -f "$WORKSPACE_REAL/packages/spark-chat/.*tailwindcss.*--watch" 2>/dev/null | while read -r TAILWIND_PID; do
+      kill_tree "$TAILWIND_PID"
+      kill -9 "$TAILWIND_PID" >/dev/null 2>&1 || true
+    done
+  after_external_waiting_start: |
+    WORKSPACE_REAL=$(pwd -P)
+
+    kill_tree() {
+      TARGET_PID=$1
+      if [ -z "$TARGET_PID" ]; then
+        return
+      fi
+
+      for CHILD_PID in $(pgrep -P "$TARGET_PID" 2>/dev/null || true); do
+        kill_tree "$CHILD_PID"
+      done
+
+      kill "$TARGET_PID" >/dev/null 2>&1 || true
+    }
+
+    if [ -f .symphony/powerchat.pid ]; then
+      PID=$(cat .symphony/powerchat.pid)
+      kill_tree "$PID"
+      sleep 1
+      for CHILD_PID in $(pgrep -P "$PID" 2>/dev/null || true); do
+        kill -9 "$CHILD_PID" >/dev/null 2>&1 || true
+      done
+      kill -9 "$PID" >/dev/null 2>&1 || true
+      rm -f .symphony/powerchat.pid
+    fi
+
+    if [ -f .symphony/powerchat.env ]; then
+      PORT=$(awk -F= '/^POWERCHAT_PORT=/{print $2}' .symphony/powerchat.env)
+      if [ -n "$PORT" ]; then
+        for LISTENER_PID in $(lsof -tiTCP:"$PORT" -sTCP:LISTEN 2>/dev/null || true); do
+          kill_tree "$LISTENER_PID"
+          sleep 1
+          kill -9 "$LISTENER_PID" >/dev/null 2>&1 || true
+        done
+      fi
+    fi
+
+    pgrep -f "$WORKSPACE_REAL/packages/spark-chat/.*tailwindcss.*--watch" 2>/dev/null | while read -r TAILWIND_PID; do
+      kill_tree "$TAILWIND_PID"
+      kill -9 "$TAILWIND_PID" >/dev/null 2>&1 || true
+    done
+
+    rm -f .symphony/keep_powerchat_preview
 agent:
+  provider: antigravity_cli
   max_concurrent_agents: 10
+  max_process_tree_rss_bytes: 5368709120
+  dispatch_rss_reservation_bytes: 402653184
+  memory_watchdog_interval_ms: 1000
   max_turns: 20
   max_turns_by_state:
     Merging: 1
@@ -45,14 +282,17 @@ agent:
     - Merging
   no_auto_codex_states:
     - Merging
-codex:
-  command: codex --config shell_environment_policy.inherit=all --config 'model="gpt-5.5"' --config model_reasoning_effort=xhigh app-server
+antigravity_cli:
+  command: agy
   approval_policy: never
-  # Codeup delivery needs Git metadata writes for branch creation, commit, fetch, and push.
-  thread_sandbox: danger-full-access
-  turn_sandbox_policy:
-    type: dangerFullAccess
-    networkAccess: true
+  print_timeout: 5m
+  turn_timeout_ms: 3600000
+observability:
+  dashboard_enabled: true
+  terminal_dashboard_enabled: false
+  refresh_ms: 1000
+  render_interval_ms: 1000
+  state_sample_interval_ms: 5000
 ---
 
 You are working on a Linear ticket `{{ issue.identifier }}`.
@@ -89,6 +329,7 @@ Execution rules:
 4. Symphony itself runs from its own repository checkout, but each issue workspace is bootstrapped from the target repository configured in `hooks.after_create` above.
 5. Work only inside the current issue workspace. Do not modify any other path.
 6. Any content written back to Linear should default to Chinese, and should be concise, clear, and reviewer-oriented.
+7. PowerChat preview starts on demand to keep parallel runs low-memory. Read `.symphony/powerchat.env`; if `POWERCHAT_PREVIEW_MODE=on_demand`, run `./.symphony/start_powerchat_preview.sh` from the workspace before browser validation or review preview work, then reread `.symphony/powerchat.env` for `POWERCHAT_URL`. Do not assume a fixed port. The script starts the same Spark Chat dumi dev server used by `pnpm run start:spark-chat`, but runs it from `packages/spark-chat` after dependency bootstrap to avoid repeated unattended installs.
 
 ## Prerequisite: Linear capability is available
 
@@ -216,6 +457,7 @@ Required Linear team states:
    - branch name
    - change request URL
    - change request ID / number when available
+   - review preview URL under `### Review Preview`, using `POWERCHAT_URL` from `.symphony/powerchat.env`
    - structured delivery metadata as JSON under `### Delivery Metadata`, using this exact schema. The `provider` value must be `codeup` so Symphony's external merge watcher can parse it:
 
      ```json
@@ -234,7 +476,7 @@ Required Linear team states:
    - key change summary
    - local validation result
    - if a pipeline result exists, record the link or status
-13. If a human reviewer needs to inspect a page, command output, or runtime behavior, include explicit reviewer instructions in the workpad.
+13. If a human reviewer needs to inspect a page, command output, or runtime behavior, include explicit reviewer instructions in the workpad. For PowerChat UI work, run `./.symphony/start_powerchat_preview.sh` if `.symphony/powerchat.env` says `POWERCHAT_PREVIEW_MODE=on_demand`, reread `.symphony/powerchat.env`, add `### Review Preview` with `POWERCHAT_URL`, and create `.symphony/keep_powerchat_preview` before moving the issue to `In Review`; Symphony will remove that marker and stop the preview when the issue first enters `Merging`.
 14. Once the change request delivery is ready for human review, move the issue to `In Review`. Never move directly from implementation to `Done`.
 
 ## Step 3: Review and merge handling

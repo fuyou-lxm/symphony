@@ -128,7 +128,11 @@ defmodule SymphonyElixir.Config.Schema do
 
     @primary_key false
     embedded_schema do
+      field(:provider, :string, default: "codex")
       field(:max_concurrent_agents, :integer, default: 10)
+      field(:max_process_tree_rss_bytes, :integer)
+      field(:dispatch_rss_reservation_bytes, :integer)
+      field(:memory_watchdog_interval_ms, :integer)
       field(:max_turns, :integer, default: 20)
       field(:max_retry_backoff_ms, :integer, default: 300_000)
       field(:max_turns_by_state, :map, default: %{})
@@ -143,7 +147,11 @@ defmodule SymphonyElixir.Config.Schema do
       |> cast(
         attrs,
         [
+          :provider,
           :max_concurrent_agents,
+          :max_process_tree_rss_bytes,
+          :dispatch_rss_reservation_bytes,
+          :memory_watchdog_interval_ms,
           :max_turns,
           :max_retry_backoff_ms,
           :max_turns_by_state,
@@ -154,6 +162,9 @@ defmodule SymphonyElixir.Config.Schema do
         empty_values: []
       )
       |> validate_number(:max_concurrent_agents, greater_than: 0)
+      |> validate_number(:max_process_tree_rss_bytes, greater_than: 0)
+      |> validate_number(:dispatch_rss_reservation_bytes, greater_than: 0)
+      |> validate_number(:memory_watchdog_interval_ms, greater_than: 0)
       |> validate_number(:max_turns, greater_than: 0)
       |> validate_number(:max_retry_backoff_ms, greater_than: 0)
       |> update_change(:max_turns_by_state, &Schema.normalize_state_limits/1)
@@ -214,6 +225,72 @@ defmodule SymphonyElixir.Config.Schema do
     end
   end
 
+  defmodule Antigravity do
+    @moduledoc false
+    use Ecto.Schema
+    import Ecto.Changeset
+
+    @primary_key false
+    embedded_schema do
+      field(:python, :string, default: "python3")
+      field(:runner, :string)
+      field(:model, :string)
+      field(:api_key, :string)
+      field(:app_data_dir, :string)
+      field(:save_dir, :string)
+      field(:approval_policy, :string, default: "never")
+      field(:turn_timeout_ms, :integer, default: 3_600_000)
+      field(:read_timeout_ms, :integer, default: 5_000)
+    end
+
+    @spec changeset(%__MODULE__{}, map()) :: Ecto.Changeset.t()
+    def changeset(schema, attrs) do
+      schema
+      |> cast(
+        attrs,
+        [
+          :python,
+          :runner,
+          :model,
+          :api_key,
+          :app_data_dir,
+          :save_dir,
+          :approval_policy,
+          :turn_timeout_ms,
+          :read_timeout_ms
+        ],
+        empty_values: []
+      )
+      |> validate_required([:python, :approval_policy])
+      |> validate_inclusion(:approval_policy, ["never", "on-request"])
+      |> validate_number(:turn_timeout_ms, greater_than: 0)
+      |> validate_number(:read_timeout_ms, greater_than: 0)
+    end
+  end
+
+  defmodule AntigravityCli do
+    @moduledoc false
+    use Ecto.Schema
+    import Ecto.Changeset
+
+    @primary_key false
+    embedded_schema do
+      field(:command, :string, default: "agy")
+      field(:approval_policy, :string, default: "never")
+      field(:print_timeout, :string, default: "5m")
+      field(:turn_timeout_ms, :integer, default: 3_600_000)
+    end
+
+    @spec changeset(%__MODULE__{}, map()) :: Ecto.Changeset.t()
+    def changeset(schema, attrs) do
+      schema
+      |> cast(attrs, [:command, :approval_policy, :print_timeout, :turn_timeout_ms], empty_values: [])
+      |> validate_required([:command, :approval_policy, :print_timeout])
+      |> validate_inclusion(:approval_policy, ["never", "on-request"])
+      |> validate_number(:turn_timeout_ms, greater_than: 0)
+    end
+  end
+
   defmodule Hooks do
     @moduledoc false
     use Ecto.Schema
@@ -224,6 +301,7 @@ defmodule SymphonyElixir.Config.Schema do
       field(:after_create, :string)
       field(:before_run, :string)
       field(:after_run, :string)
+      field(:after_external_waiting_start, :string)
       field(:before_remove, :string)
       field(:timeout_ms, :integer, default: 60_000)
     end
@@ -231,7 +309,7 @@ defmodule SymphonyElixir.Config.Schema do
     @spec changeset(%__MODULE__{}, map()) :: Ecto.Changeset.t()
     def changeset(schema, attrs) do
       schema
-      |> cast(attrs, [:after_create, :before_run, :after_run, :before_remove, :timeout_ms], empty_values: [])
+      |> cast(attrs, [:after_create, :before_run, :after_run, :after_external_waiting_start, :before_remove, :timeout_ms], empty_values: [])
       |> validate_number(:timeout_ms, greater_than: 0)
     end
   end
@@ -244,16 +322,19 @@ defmodule SymphonyElixir.Config.Schema do
     @primary_key false
     embedded_schema do
       field(:dashboard_enabled, :boolean, default: true)
+      field(:terminal_dashboard_enabled, :boolean, default: true)
       field(:refresh_ms, :integer, default: 1_000)
-      field(:render_interval_ms, :integer, default: 16)
+      field(:render_interval_ms, :integer, default: 1_000)
+      field(:state_sample_interval_ms, :integer, default: 5_000)
     end
 
     @spec changeset(%__MODULE__{}, map()) :: Ecto.Changeset.t()
     def changeset(schema, attrs) do
       schema
-      |> cast(attrs, [:dashboard_enabled, :refresh_ms, :render_interval_ms], empty_values: [])
+      |> cast(attrs, [:dashboard_enabled, :terminal_dashboard_enabled, :refresh_ms, :render_interval_ms, :state_sample_interval_ms], empty_values: [])
       |> validate_number(:refresh_ms, greater_than: 0)
       |> validate_number(:render_interval_ms, greater_than: 0)
+      |> validate_number(:state_sample_interval_ms, greater_than: 0)
     end
   end
 
@@ -283,6 +364,8 @@ defmodule SymphonyElixir.Config.Schema do
     embeds_one(:worker, Worker, on_replace: :update, defaults_to_struct: true)
     embeds_one(:agent, Agent, on_replace: :update, defaults_to_struct: true)
     embeds_one(:codex, Codex, on_replace: :update, defaults_to_struct: true)
+    embeds_one(:antigravity, Antigravity, on_replace: :update, defaults_to_struct: true)
+    embeds_one(:antigravity_cli, AntigravityCli, on_replace: :update, defaults_to_struct: true)
     embeds_one(:hooks, Hooks, on_replace: :update, defaults_to_struct: true)
     embeds_one(:observability, Observability, on_replace: :update, defaults_to_struct: true)
     embeds_one(:server, Server, on_replace: :update, defaults_to_struct: true)
@@ -386,6 +469,8 @@ defmodule SymphonyElixir.Config.Schema do
     |> cast_embed(:worker, with: &Worker.changeset/2)
     |> cast_embed(:agent, with: &Agent.changeset/2)
     |> cast_embed(:codex, with: &Codex.changeset/2)
+    |> cast_embed(:antigravity, with: &Antigravity.changeset/2)
+    |> cast_embed(:antigravity_cli, with: &AntigravityCli.changeset/2)
     |> cast_embed(:hooks, with: &Hooks.changeset/2)
     |> cast_embed(:observability, with: &Observability.changeset/2)
     |> cast_embed(:server, with: &Server.changeset/2)
@@ -409,7 +494,15 @@ defmodule SymphonyElixir.Config.Schema do
         turn_sandbox_policy: normalize_optional_map(settings.codex.turn_sandbox_policy)
     }
 
-    %{settings | tracker: tracker, workspace: workspace, codex: codex}
+    antigravity = %{
+      settings.antigravity
+      | runner: resolve_path_value(settings.antigravity.runner, default_antigravity_runner_path()),
+        api_key: resolve_secret_setting(settings.antigravity.api_key, nil),
+        app_data_dir: resolve_optional_path_value(settings.antigravity.app_data_dir),
+        save_dir: resolve_optional_path_value(settings.antigravity.save_dir)
+    }
+
+    %{settings | tracker: tracker, workspace: workspace, codex: codex, antigravity: antigravity}
   end
 
   defp normalize_keys(value) when is_map(value) do
@@ -459,6 +552,25 @@ defmodule SymphonyElixir.Config.Schema do
       path ->
         path
     end
+  end
+
+  defp resolve_path_value(_value, default), do: default
+
+  defp resolve_optional_path_value(value) when is_binary(value) do
+    case normalize_path_token(value) do
+      :missing -> nil
+      "" -> nil
+      path -> path
+    end
+  end
+
+  defp resolve_optional_path_value(_value), do: nil
+
+  defp default_antigravity_runner_path do
+    :symphony_elixir
+    |> :code.priv_dir()
+    |> to_string()
+    |> Path.join("antigravity_sdk_runner.py")
   end
 
   defp resolve_env_value(value, fallback) when is_binary(value) do

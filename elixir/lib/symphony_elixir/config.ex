@@ -26,6 +26,25 @@ defmodule SymphonyElixir.Config do
           turn_sandbox_policy: map()
         }
 
+  @type antigravity_runtime_settings :: %{
+          python: String.t(),
+          runner: String.t(),
+          model: String.t() | nil,
+          api_key: String.t() | nil,
+          app_data_dir: String.t() | nil,
+          save_dir: String.t() | nil,
+          approval_policy: String.t(),
+          turn_timeout_ms: pos_integer(),
+          read_timeout_ms: pos_integer()
+        }
+
+  @type antigravity_cli_runtime_settings :: %{
+          command: String.t(),
+          approval_policy: String.t(),
+          print_timeout: String.t(),
+          turn_timeout_ms: pos_integer()
+        }
+
   @spec settings() :: {:ok, Schema.t()} | {:error, term()}
   def settings do
     case Workflow.current() do
@@ -146,6 +165,37 @@ defmodule SymphonyElixir.Config do
     end
   end
 
+  @spec antigravity_runtime_settings() :: {:ok, antigravity_runtime_settings()} | {:error, term()}
+  def antigravity_runtime_settings do
+    with {:ok, settings} <- settings() do
+      {:ok,
+       %{
+         python: settings.antigravity.python,
+         runner: settings.antigravity.runner,
+         model: settings.antigravity.model,
+         api_key: settings.antigravity.api_key,
+         app_data_dir: settings.antigravity.app_data_dir,
+         save_dir: settings.antigravity.save_dir,
+         approval_policy: settings.antigravity.approval_policy,
+         turn_timeout_ms: settings.antigravity.turn_timeout_ms,
+         read_timeout_ms: settings.antigravity.read_timeout_ms
+       }}
+    end
+  end
+
+  @spec antigravity_cli_runtime_settings() :: {:ok, antigravity_cli_runtime_settings()} | {:error, term()}
+  def antigravity_cli_runtime_settings do
+    with {:ok, settings} <- settings() do
+      {:ok,
+       %{
+         command: settings.antigravity_cli.command,
+         approval_policy: settings.antigravity_cli.approval_policy,
+         print_timeout: settings.antigravity_cli.print_timeout,
+         turn_timeout_ms: settings.antigravity_cli.turn_timeout_ms
+       }}
+    end
+  end
+
   defp validate_semantics(settings) do
     cond do
       is_nil(settings.tracker.kind) ->
@@ -159,6 +209,9 @@ defmodule SymphonyElixir.Config do
 
       settings.tracker.kind == "linear" and not is_binary(settings.tracker.project_slug) ->
         {:error, :missing_linear_project_slug}
+
+      settings.agent.provider not in ["codex", "antigravity_sdk", "antigravity_cli"] ->
+        {:error, {:unsupported_agent_provider, settings.agent.provider}}
 
       true ->
         :ok

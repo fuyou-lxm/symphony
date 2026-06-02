@@ -72,8 +72,55 @@ defmodule SymphonyElixir.ExtensionsTest do
       {:reply, Keyword.fetch!(state, :snapshot), state}
     end
 
+    def handle_call(:counts_snapshot, _from, state) do
+      snapshot = Keyword.fetch!(state, :snapshot)
+
+      {:reply,
+       %{
+         counts: %{
+           running: length(Map.get(snapshot, :running, [])),
+           retrying: length(Map.get(snapshot, :retrying, [])),
+           blocked: length(Map.get(snapshot, :blocked, [])),
+           external_waiting: length(Map.get(snapshot, :external_waiting, []))
+         },
+         running_preview_workspaces:
+           snapshot
+           |> Map.get(:running, [])
+           |> Enum.map(&Map.get(&1, :workspace_path))
+           |> Enum.filter(&(is_binary(&1) and &1 != ""))
+           |> Enum.uniq()
+       }, state}
+    end
+
     def handle_call(:request_refresh, _from, state) do
       {:reply, Keyword.get(state, :refresh, :unavailable), state}
+    end
+  end
+
+  defmodule CountsOnlyOrchestrator do
+    use GenServer
+
+    def start_link(opts) do
+      name = Keyword.fetch!(opts, :name)
+      GenServer.start_link(__MODULE__, opts, name: name)
+    end
+
+    def init(opts), do: {:ok, opts}
+
+    def handle_call(:snapshot, _from, state) do
+      if recipient = Keyword.get(state, :recipient) do
+        send(recipient, :full_snapshot_called)
+      end
+
+      raise "full snapshot should not be used by /api/v1/memory"
+    end
+
+    def handle_call(:counts_snapshot, _from, state) do
+      if recipient = Keyword.get(state, :recipient) do
+        send(recipient, :counts_snapshot_called)
+      end
+
+      {:reply, Keyword.fetch!(state, :counts_snapshot), state}
     end
   end
 
@@ -98,6 +145,11 @@ defmodule SymphonyElixir.ExtensionsTest do
       Application.put_env(:symphony_elixir, SymphonyElixirWeb.Endpoint, endpoint_config)
     end)
 
+    :ok
+  end
+
+  setup do
+    reset_observability_pubsub()
     :ok
   end
 
@@ -139,6 +191,7 @@ defmodule SymphonyElixir.ExtensionsTest do
     existing_path = Workflow.workflow_file_path()
     manual_path = Path.join(Path.dirname(existing_path), "MANUAL_WORKFLOW.md")
     missing_path = Path.join(Path.dirname(existing_path), "MANUAL_MISSING_WORKFLOW.md")
+    poll_receive_timeout_ms = 2_500
 
     assert :ok = Supervisor.terminate_child(SymphonyElixir.Supervisor, WorkflowStore)
 
@@ -152,24 +205,25 @@ defmodule SymphonyElixir.ExtensionsTest do
 
     assert {:ok, manual_pid} = WorkflowStore.start_link()
     assert Process.alive?(manual_pid)
+    on_exit(fn -> if Process.alive?(manual_pid), do: Process.exit(manual_pid, :normal) end)
 
     state = :sys.get_state(manual_pid)
     File.write!(manual_path, "---\ntracker: [\n---\nBroken prompt\n")
     assert {:noreply, returned_state} = WorkflowStore.handle_info(:poll, state)
     assert returned_state.workflow.prompt == "Manual workflow prompt"
     refute returned_state.stamp == nil
-    assert_receive :poll, 1_100
+    assert_receive :poll, poll_receive_timeout_ms
 
     Workflow.set_workflow_file_path(missing_path)
     assert {:noreply, path_error_state} = WorkflowStore.handle_info(:poll, returned_state)
     assert path_error_state.workflow.prompt == "Manual workflow prompt"
-    assert_receive :poll, 1_100
+    assert_receive :poll, poll_receive_timeout_ms
 
     Workflow.set_workflow_file_path(manual_path)
     File.rm!(manual_path)
     assert {:noreply, removed_state} = WorkflowStore.handle_info(:poll, path_error_state)
     assert removed_state.workflow.prompt == "Manual workflow prompt"
-    assert_receive :poll, 1_100
+    assert_receive :poll, poll_receive_timeout_ms
 
     Process.exit(manual_pid, :normal)
     restart_result = Supervisor.restart_child(SymphonyElixir.Supervisor, WorkflowStore)
@@ -322,6 +376,18 @@ defmodule SymphonyElixir.ExtensionsTest do
   test "phoenix observability api preserves state, issue, and refresh responses" do
     snapshot = static_snapshot()
     orchestrator_name = Module.concat(__MODULE__, :ObservabilityApiOrchestrator)
+    symphony_pid = System.pid() |> String.to_integer()
+    previous_rows = Application.get_env(:symphony_elixir, :process_memory_ps_rows)
+    previous_rows_provider = Application.get_env(:symphony_elixir, :process_memory_ps_rows_provider)
+
+    on_exit(fn ->
+      restore_app_env(:process_memory_ps_rows, previous_rows)
+      restore_app_env(:process_memory_ps_rows_provider, previous_rows_provider)
+    end)
+
+    Application.put_env(:symphony_elixir, :process_memory_ps_rows, [
+      %{pid: symphony_pid, ppid: 1, rss_kb: 123, command: "beam.smp"}
+    ])
 
     {:ok, _pid} =
       StaticOrchestrator.start_link(
@@ -342,7 +408,13 @@ defmodule SymphonyElixir.ExtensionsTest do
 
     assert state_payload == %{
              "generated_at" => state_payload["generated_at"],
-             "counts" => %{"running" => 1, "retrying" => 1, "blocked" => 1, "external_waiting" => 1},
+             "counts" => %{
+               "running" => 1,
+               "retrying" => 1,
+               "blocked" => 1,
+               "external_waiting" => 1,
+               "recent_external_finalizations" => 1
+             },
              "running" => [
                %{
                  "issue_id" => "issue-http",
@@ -403,13 +475,74 @@ defmodule SymphonyElixir.ExtensionsTest do
                  "url" => "https://codeup.example/change/4"
                }
              ],
+             "recent_external_finalizations" => [
+               %{
+                 "issue_id" => "issue-recent-external",
+                 "issue_identifier" => "MT-RECENT-EXT",
+                 "linear_state" => "Merging",
+                 "provider" => "codeup",
+                 "change_request" => "5",
+                 "cr_status" => "MERGED",
+                 "revision" => "rev-recent",
+                 "observed_key" => "codeup:org-123:6907286:5:MERGED:rev-recent",
+                 "target_state" => "Done",
+                 "reason" => "external_merged",
+                 "token_policy" => "no_codex",
+                 "workspace_cleanup" => "ok",
+                 "finalized_at" => state_payload["recent_external_finalizations"] |> List.first() |> Map.fetch!("finalized_at"),
+                 "url" => "https://codeup.example/change/5"
+               }
+             ],
              "codex_totals" => %{
                "input_tokens" => 4,
                "output_tokens" => 8,
                "total_tokens" => 12,
                "seconds_running" => 42.5
              },
+             "process_memory" => %{
+               "symphony_process_tree" => %{
+                 "root_pid" => symphony_pid,
+                 "process_count" => 1,
+                 "rss_kb" => 123,
+                 "rss_bytes" => 123 * 1024,
+                 "command" => "beam.smp"
+               },
+               "symphony_process_tree_rss_bytes" => 123 * 1024,
+               "symphony_process_tree_rss_kb" => 123,
+               "symphony_process_tree_process_count" => 1,
+               "running_preview_process_count" => 0,
+               "running_preview_rss_bytes" => 0,
+               "running_preview_rss_kb" => 0
+             },
              "rate_limits" => %{"primary" => %{"remaining" => 11}}
+           }
+
+    conn = get(build_conn(), "/api/v1/memory")
+    memory_payload = json_response(conn, 200)
+
+    assert memory_payload == %{
+             "generated_at" => memory_payload["generated_at"],
+             "counts" => %{
+               "running" => 1,
+               "retrying" => 1,
+               "blocked" => 1,
+               "external_waiting" => 1
+             },
+             "process_memory" => %{
+               "symphony_process_tree" => %{
+                 "root_pid" => symphony_pid,
+                 "process_count" => 1,
+                 "rss_kb" => 123,
+                 "rss_bytes" => 123 * 1024,
+                 "command" => "beam.smp"
+               },
+               "symphony_process_tree_rss_bytes" => 123 * 1024,
+               "symphony_process_tree_rss_kb" => 123,
+               "symphony_process_tree_process_count" => 1,
+               "running_preview_process_count" => 0,
+               "running_preview_rss_bytes" => 0,
+               "running_preview_rss_kb" => 0
+             }
            }
 
     conn = get(build_conn(), "/api/v1/MT-HTTP")
@@ -492,6 +625,169 @@ defmodule SymphonyElixir.ExtensionsTest do
 
     assert %{"queued" => true, "coalesced" => false, "operations" => ["poll", "reconcile"]} =
              json_response(conn, 202)
+  end
+
+  test "phoenix observability api reports running workspace preview process memory" do
+    workspace =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-elixir-observability-memory-#{System.unique_integer([:positive])}"
+      )
+
+    previous_rows = Application.get_env(:symphony_elixir, :process_memory_ps_rows)
+    previous_rows_provider = Application.get_env(:symphony_elixir, :process_memory_ps_rows_provider)
+
+    on_exit(fn ->
+      restore_app_env(:process_memory_ps_rows, previous_rows)
+      restore_app_env(:process_memory_ps_rows_provider, previous_rows_provider)
+      File.rm_rf(workspace)
+    end)
+
+    File.mkdir_p!(Path.join(workspace, ".symphony"))
+    File.write!(Path.join([workspace, ".symphony", "powerchat.pid"]), "300\n")
+
+    symphony_pid = System.pid() |> String.to_integer()
+
+    rows = [
+      %{pid: symphony_pid, ppid: 1, rss_kb: 1_000, command: "beam.smp"},
+      %{pid: symphony_pid + 1, ppid: symphony_pid, rss_kb: 2_000, command: "agy"},
+      %{pid: 300, ppid: 1, rss_kb: 100, command: "sh"},
+      %{pid: 301, ppid: 300, rss_kb: 200, command: "node"}
+    ]
+
+    parent = self()
+
+    Application.put_env(:symphony_elixir, :process_memory_ps_rows_provider, fn ->
+      send(parent, :process_memory_rows_read)
+      rows
+    end)
+
+    Application.delete_env(:symphony_elixir, :process_memory_ps_rows)
+
+    snapshot =
+      update_in(static_snapshot().running, fn [entry] ->
+        [Map.put(entry, :workspace_path, workspace)]
+      end)
+
+    orchestrator_name = Module.concat(__MODULE__, :ObservabilityMemoryOrchestrator)
+
+    {:ok, _pid} =
+      StaticOrchestrator.start_link(
+        name: orchestrator_name,
+        snapshot: snapshot
+      )
+
+    start_test_endpoint(orchestrator: orchestrator_name, snapshot_timeout_ms: 50)
+
+    conn = get(build_conn(), "/api/v1/state")
+    state_payload = json_response(conn, 200)
+
+    assert state_payload["process_memory"] == %{
+             "symphony_process_tree" => %{
+               "root_pid" => symphony_pid,
+               "process_count" => 2,
+               "rss_kb" => 3_000,
+               "rss_bytes" => 3_000 * 1024,
+               "command" => "beam.smp"
+             },
+             "symphony_process_tree_rss_bytes" => 3_000 * 1024,
+             "symphony_process_tree_rss_kb" => 3_000,
+             "symphony_process_tree_process_count" => 2,
+             "running_preview_process_count" => 2,
+             "running_preview_rss_bytes" => 300 * 1024,
+             "running_preview_rss_kb" => 300
+           }
+
+    assert [running] = state_payload["running"]
+
+    assert running["process_memory"]["preview"] == %{
+             "root_pid" => 300,
+             "process_count" => 2,
+             "rss_kb" => 300,
+             "rss_bytes" => 300 * 1024,
+             "command" => "sh"
+           }
+
+    assert_receive :process_memory_rows_read
+    refute_receive :process_memory_rows_read
+  end
+
+  test "phoenix observability memory API avoids full state snapshots" do
+    orchestrator_name = Module.concat(__MODULE__, :CountsOnlyMemoryOrchestrator)
+    symphony_pid = System.pid() |> String.to_integer()
+    parent = self()
+    previous_rows = Application.get_env(:symphony_elixir, :process_memory_ps_rows)
+    previous_rows_provider = Application.get_env(:symphony_elixir, :process_memory_ps_rows_provider)
+
+    on_exit(fn ->
+      restore_app_env(:process_memory_ps_rows, previous_rows)
+      restore_app_env(:process_memory_ps_rows_provider, previous_rows_provider)
+    end)
+
+    Application.put_env(:symphony_elixir, :process_memory_ps_rows_provider, fn ->
+      send(parent, :process_memory_rows_read)
+      [%{pid: symphony_pid, ppid: 1, rss_kb: 456, command: "beam.smp"}]
+    end)
+
+    Application.delete_env(:symphony_elixir, :process_memory_ps_rows)
+
+    {:ok, _pid} =
+      CountsOnlyOrchestrator.start_link(
+        name: orchestrator_name,
+        recipient: parent,
+        counts_snapshot: %{
+          counts: %{running: 10, retrying: 0, blocked: 0, external_waiting: 0},
+          running_preview_workspaces: []
+        }
+      )
+
+    start_test_endpoint(orchestrator: orchestrator_name, snapshot_timeout_ms: 50)
+
+    payload = get(build_conn(), "/api/v1/memory") |> json_response(200)
+
+    assert payload["counts"] == %{"running" => 10, "retrying" => 0, "blocked" => 0, "external_waiting" => 0}
+    assert payload["process_memory"]["symphony_process_tree_rss_bytes"] == 456 * 1024
+
+    assert_receive :counts_snapshot_called
+    assert_receive :process_memory_rows_read
+    refute_receive :full_snapshot_called, 50
+  end
+
+  test "phoenix observability state API reuses one payload within the refresh window" do
+    orchestrator_name = Module.concat(__MODULE__, :CachedObservabilityApiOrchestrator)
+    symphony_pid = System.pid() |> String.to_integer()
+    parent = self()
+    previous_rows = Application.get_env(:symphony_elixir, :process_memory_ps_rows)
+    previous_rows_provider = Application.get_env(:symphony_elixir, :process_memory_ps_rows_provider)
+
+    on_exit(fn ->
+      restore_app_env(:process_memory_ps_rows, previous_rows)
+      restore_app_env(:process_memory_ps_rows_provider, previous_rows_provider)
+    end)
+
+    Application.put_env(:symphony_elixir, :process_memory_ps_rows_provider, fn ->
+      send(parent, :process_memory_rows_read)
+      [%{pid: symphony_pid, ppid: 1, rss_kb: 123, command: "beam.smp"}]
+    end)
+
+    Application.delete_env(:symphony_elixir, :process_memory_ps_rows)
+
+    {:ok, _pid} =
+      StaticOrchestrator.start_link(
+        name: orchestrator_name,
+        snapshot: static_snapshot()
+      )
+
+    start_test_endpoint(orchestrator: orchestrator_name, snapshot_timeout_ms: 50)
+
+    assert %{"counts" => %{"running" => 1}} =
+             get(build_conn(), "/api/v1/state") |> json_response(200)
+
+    assert %{"counts" => %{"running" => 1}} =
+             get(build_conn(), "/api/v1/state") |> json_response(200)
+
+    assert_receive :process_memory_rows_read
+    refute_receive :process_memory_rows_read, 50
   end
 
   test "phoenix observability api preserves 405, 404, and unavailable behavior" do
@@ -615,6 +911,10 @@ defmodule SymphonyElixir.ExtensionsTest do
     assert html =~ "TO_BE_MERGED"
     assert html =~ "no_codex"
     assert html =~ "metadata_missing"
+    assert html =~ "Recent external finalizations"
+    assert html =~ "MT-RECENT-EXT"
+    assert html =~ "rev-recent"
+    assert html =~ "workspace cleanup"
     assert html =~ "rendered"
     assert html =~ "turn blocked: waiting for user input"
     assert html =~ "Runtime"
@@ -622,8 +922,11 @@ defmodule SymphonyElixir.ExtensionsTest do
     assert html =~ "Offline"
     assert html =~ "Copy ID"
     assert html =~ "Codex update"
-    refute html =~ "data-runtime-clock="
-    refute html =~ "setInterval(refreshRuntimeClocks"
+    assert html =~ "data-runtime-clock="
+    assert html =~ "setInterval(refreshRuntimeClocks"
+    Process.sleep(1_100)
+    assert {:messages, messages} = Process.info(view.pid, :messages)
+    refute :runtime_tick in messages
     refute html =~ "Refresh now"
     refute html =~ "Transport"
     assert html =~ "status-badge-live"
@@ -665,9 +968,47 @@ defmodule SymphonyElixir.ExtensionsTest do
 
     StatusDashboard.notify_update()
 
-    assert_eventually(fn ->
-      render(view) =~ "agent message content streaming: structured update"
-    end)
+    assert_eventually(
+      fn ->
+        render(view) =~ "agent message content streaming: structured update"
+      end,
+      80
+    )
+  end
+
+  test "dashboard liveview renders Chinese interface text when requested" do
+    orchestrator_name = Module.concat(__MODULE__, :ChineseDashboardOrchestrator)
+    snapshot = %{static_snapshot() | rate_limits: nil}
+
+    {:ok, _pid} =
+      StaticOrchestrator.start_link(
+        name: orchestrator_name,
+        snapshot: snapshot,
+        refresh: %{
+          queued: true,
+          coalesced: true,
+          requested_at: DateTime.utc_now(),
+          operations: ["poll"]
+        }
+      )
+
+    start_test_endpoint(orchestrator: orchestrator_name, snapshot_timeout_ms: 50)
+
+    {:ok, _view, html} = live(build_conn(), "/?lang=zh-CN")
+    assert html =~ ~s(<html lang="zh-CN">)
+    assert html =~ "运维仪表盘"
+    assert html =~ "运行会话"
+    assert html =~ "外部等待"
+    assert html =~ "最近外部完成"
+    assert html =~ "复制 ID"
+    assert html =~ "Codex 更新"
+    assert html =~ "0分"
+    assert html =~ ~s(<pre class="code-panel">无</pre>)
+    assert html =~ "MT-HTTP"
+    assert html =~ "TO_BE_MERGED"
+    assert html =~ "no_codex"
+    refute html =~ "Operations Dashboard"
+    refute html =~ "Running sessions"
   end
 
   test "dashboard liveview renders an unavailable state without crashing" do
@@ -715,7 +1056,14 @@ defmodule SymphonyElixir.ExtensionsTest do
 
     response = Req.get!("http://127.0.0.1:#{port}/api/v1/state")
     assert response.status == 200
-    assert response.body["counts"] == %{"running" => 1, "retrying" => 1, "blocked" => 1, "external_waiting" => 1}
+
+    assert response.body["counts"] == %{
+             "running" => 1,
+             "retrying" => 1,
+             "blocked" => 1,
+             "external_waiting" => 1,
+             "recent_external_finalizations" => 1
+           }
 
     dashboard_css = Req.get!("http://127.0.0.1:#{port}/dashboard.css")
     assert dashboard_css.status == 200
@@ -822,6 +1170,24 @@ defmodule SymphonyElixir.ExtensionsTest do
           url: "https://codeup.example/change/4"
         }
       ],
+      recent_external_finalizations: [
+        %{
+          issue_id: "issue-recent-external",
+          identifier: "MT-RECENT-EXT",
+          state: "Merging",
+          provider: "codeup",
+          change_request_id: "5",
+          cr_status: "MERGED",
+          revision: "rev-recent",
+          observed_key: "codeup:org-123:6907286:5:MERGED:rev-recent",
+          target_state: "Done",
+          reason: :external_merged,
+          token_policy: :no_codex,
+          workspace_cleanup: :ok,
+          finalized_at: DateTime.utc_now(),
+          url: "https://codeup.example/change/5"
+        }
+      ],
       codex_totals: %{input_tokens: 4, output_tokens: 8, total_tokens: 12, seconds_running: 42.5},
       rate_limits: %{"primary" => %{"remaining" => 11}}
     }
@@ -847,6 +1213,26 @@ defmodule SymphonyElixir.ExtensionsTest do
   end
 
   defp assert_eventually(_fun, 0), do: flunk("condition not met in time")
+
+  defp restore_app_env(key, nil), do: Application.delete_env(:symphony_elixir, key)
+  defp restore_app_env(key, value), do: Application.put_env(:symphony_elixir, key, value)
+
+  defp reset_observability_pubsub do
+    if Process.whereis(SymphonyElixirWeb.ObservabilityPubSub) do
+      :sys.replace_state(SymphonyElixirWeb.ObservabilityPubSub, fn state ->
+        %{
+          state
+          | last_broadcast_at_ms: nil,
+            pending?: false,
+            timer_ref: nil
+        }
+      end)
+    end
+
+    :ets.delete(:symphony_observability_pubsub_pending, :dashboard_update)
+  rescue
+    ArgumentError -> :ok
+  end
 
   defp ensure_workflow_store_running do
     if Process.whereis(WorkflowStore) do

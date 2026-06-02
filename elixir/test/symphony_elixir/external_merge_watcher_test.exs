@@ -41,6 +41,16 @@ defmodule SymphonyElixir.ExternalMergeWatcherTest do
     assert metadata.last_observed_status == "TO_BE_MERGED"
   end
 
+  test "normalizes legacy Yunxiao Codeup provider metadata aliases" do
+    issue = codeup_issue(provider: "yunxiao_codeup")
+
+    assert {:ok, metadata} = ExternalMergeWatcher.delivery_metadata(issue)
+    assert metadata.provider == "codeup"
+    assert metadata.organization_id == "org-123"
+    assert metadata.repository_id == "6907286"
+    assert metadata.change_request_id == "3"
+  end
+
   test "unchanged Codeup CR state keeps waiting without reporting a terminal change" do
     issue = codeup_issue(last_observed_cr_state: "TO_BE_MERGED")
 

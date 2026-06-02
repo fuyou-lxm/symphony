@@ -7,11 +7,14 @@ defmodule SymphonyElixirWeb.Layouts do
 
   @spec root(map()) :: Phoenix.LiveView.Rendered.t()
   def root(assigns) do
-    assigns = assign(assigns, :csrf_token, Plug.CSRFProtection.get_csrf_token())
+    assigns =
+      assigns
+      |> assign(:csrf_token, Plug.CSRFProtection.get_csrf_token())
+      |> assign_new(:locale, fn -> "en" end)
 
     ~H"""
     <!DOCTYPE html>
-    <html lang="en">
+    <html lang={@locale}>
       <head>
         <meta charset="utf-8" />
         <meta name="viewport" content="width=device-width, initial-scale=1" />
@@ -34,6 +37,42 @@ defmodule SymphonyElixirWeb.Layouts do
 
             liveSocket.connect();
             window.liveSocket = liveSocket;
+
+            function formatRuntimeSeconds(seconds, locale) {
+              var wholeSeconds = Math.max(Math.trunc(seconds || 0), 0);
+              var mins = Math.floor(wholeSeconds / 60);
+              var secs = wholeSeconds % 60;
+
+              if (locale === "zh-CN") return mins + "分 " + secs + "秒";
+
+              return mins + "m " + secs + "s";
+            }
+
+            function refreshRuntimeClocks() {
+              var nowSeconds = Math.floor(Date.now() / 1000);
+
+              document.querySelectorAll("[data-runtime-clock]").forEach(function (node) {
+                var locale = node.dataset.locale || "en";
+
+                if (node.dataset.runtimeClock === "total") {
+                  var baseSeconds = Number(node.dataset.baseSeconds || 0);
+                  var renderedAt = Number(node.dataset.renderedAt || nowSeconds);
+                  node.textContent = formatRuntimeSeconds(baseSeconds + nowSeconds - renderedAt, locale);
+                  return;
+                }
+
+                if (node.dataset.runtimeClock === "session") {
+                  var startedAt = Number(node.dataset.startedAt || nowSeconds);
+                  var turnCount = Number(node.dataset.turnCount || 0);
+                  var runtime = formatRuntimeSeconds(nowSeconds - startedAt, locale);
+
+                  node.textContent = turnCount > 0 ? runtime + " / " + turnCount : runtime;
+                }
+              });
+            }
+
+            refreshRuntimeClocks();
+            setInterval(refreshRuntimeClocks, 1000);
           });
         </script>
         <link rel="stylesheet" href="/dashboard.css" />

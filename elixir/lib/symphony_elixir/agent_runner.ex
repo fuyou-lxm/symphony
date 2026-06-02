@@ -4,8 +4,9 @@ defmodule SymphonyElixir.AgentRunner do
   """
 
   require Logger
-  alias SymphonyElixir.Codex.AppServer
-  alias SymphonyElixir.{Config, Linear.Issue, PromptBuilder, Tracker, Workspace}
+  alias SymphonyElixir.{AgentProvider, CodexUpdateCompactor, Config, Linear.Issue, PromptBuilder, Tracker, Workspace}
+
+  @antigravity_log_update_interval_ms 1_000
 
   @type worker_host :: String.t() | nil
 
@@ -48,13 +49,50 @@ defmodule SymphonyElixir.AgentRunner do
 
   defp codex_message_handler(recipient, issue) do
     fn message ->
-      send_codex_update(recipient, issue, message)
+      if forward_codex_update?(message) do
+        send_codex_update(recipient, issue, message)
+      else
+        :ok
+      end
     end
   end
 
+  defp forward_codex_update?(message) do
+    if antigravity_cli_log_update?(message) do
+      now_ms = System.monotonic_time(:millisecond)
+      last_sent = Process.get(:symphony_last_antigravity_log_update)
+      turn_id = antigravity_cli_log_turn_id(message)
+
+      forward? =
+        case last_sent do
+          %{sent_at_ms: last_sent_at_ms, turn_id: ^turn_id} when is_integer(last_sent_at_ms) ->
+            now_ms - last_sent_at_ms >= @antigravity_log_update_interval_ms
+
+          _ ->
+            true
+        end
+
+      if forward? do
+        Process.put(:symphony_last_antigravity_log_update, %{sent_at_ms: now_ms, turn_id: turn_id})
+      end
+
+      forward?
+    else
+      true
+    end
+  end
+
+  defp antigravity_cli_log_update?(%{payload: %{payload: %{"method" => "antigravity_cli/event/log"}}}), do: true
+  defp antigravity_cli_log_update?(%{payload: %{"method" => "antigravity_cli/event/log"}}), do: true
+  defp antigravity_cli_log_update?(_message), do: false
+
+  defp antigravity_cli_log_turn_id(%{payload: %{payload: %{"params" => %{"turn_id" => turn_id}}}}) when is_binary(turn_id), do: turn_id
+  defp antigravity_cli_log_turn_id(%{payload: %{"params" => %{"turn_id" => turn_id}}}) when is_binary(turn_id), do: turn_id
+  defp antigravity_cli_log_turn_id(_message), do: nil
+
   defp send_codex_update(recipient, %Issue{id: issue_id}, message)
        when is_binary(issue_id) and is_pid(recipient) do
-    send(recipient, {:codex_worker_update, issue_id, message})
+    send(recipient, {:codex_worker_update, issue_id, CodexUpdateCompactor.compact(message)})
     :ok
   end
 
@@ -79,21 +117,32 @@ defmodule SymphonyElixir.AgentRunner do
   defp run_codex_turns(workspace, issue, codex_update_recipient, opts, worker_host) do
     max_turns = Keyword.get(opts, :max_turns, Config.max_turns_for_state(issue.state))
     issue_state_fetcher = Keyword.get(opts, :issue_state_fetcher, &Tracker.fetch_issue_states_by_ids/1)
+    provider = Keyword.get(opts, :agent_provider, AgentProvider.configured_provider())
 
-    with {:ok, session} <- AppServer.start_session(workspace, worker_host: worker_host) do
+    with {:ok, session} <- provider.start_session(workspace, worker_host: worker_host) do
       try do
-        do_run_codex_turns(session, workspace, issue, codex_update_recipient, opts, issue_state_fetcher, 1, max_turns)
+        do_run_codex_turns(
+          provider,
+          session,
+          workspace,
+          issue,
+          codex_update_recipient,
+          opts,
+          issue_state_fetcher,
+          1,
+          max_turns
+        )
       after
-        AppServer.stop_session(session)
+        provider.stop_session(session)
       end
     end
   end
 
-  defp do_run_codex_turns(app_session, workspace, issue, codex_update_recipient, opts, issue_state_fetcher, turn_number, max_turns) do
+  defp do_run_codex_turns(provider, app_session, workspace, issue, codex_update_recipient, opts, issue_state_fetcher, turn_number, max_turns) do
     prompt = build_turn_prompt(issue, opts, turn_number, max_turns)
 
     with {:ok, turn_session} <-
-           AppServer.run_turn(
+           provider.run_turn(
              app_session,
              prompt,
              issue,
@@ -111,7 +160,8 @@ defmodule SymphonyElixir.AgentRunner do
             opts,
             issue_state_fetcher,
             turn_number,
-            max_turns
+            max_turns,
+            provider
           )
 
         {:done, _refreshed_issue} ->
@@ -123,7 +173,7 @@ defmodule SymphonyElixir.AgentRunner do
     end
   end
 
-  defp maybe_continue_active_issue(app_session, workspace, refreshed_issue, codex_update_recipient, opts, issue_state_fetcher, turn_number, max_turns) do
+  defp maybe_continue_active_issue(app_session, workspace, refreshed_issue, codex_update_recipient, opts, issue_state_fetcher, turn_number, max_turns, provider) do
     if Config.no_auto_codex_for_state?(refreshed_issue.state) do
       Logger.info("Stopping in-process continuation for #{issue_context(refreshed_issue)} state=#{refreshed_issue.state}; no-auto-Codex policy is active")
 
@@ -137,16 +187,18 @@ defmodule SymphonyElixir.AgentRunner do
         opts,
         issue_state_fetcher,
         turn_number,
-        max_turns
+        max_turns,
+        provider
       )
     end
   end
 
-  defp continue_active_issue(app_session, workspace, refreshed_issue, codex_update_recipient, opts, issue_state_fetcher, turn_number, max_turns)
+  defp continue_active_issue(app_session, workspace, refreshed_issue, codex_update_recipient, opts, issue_state_fetcher, turn_number, max_turns, provider)
        when turn_number < max_turns do
     Logger.info("Continuing agent run for #{issue_context(refreshed_issue)} after normal turn completion turn=#{turn_number}/#{max_turns}")
 
     do_run_codex_turns(
+      provider,
       app_session,
       workspace,
       refreshed_issue,
@@ -158,7 +210,7 @@ defmodule SymphonyElixir.AgentRunner do
     )
   end
 
-  defp continue_active_issue(_app_session, _workspace, refreshed_issue, _codex_update_recipient, _opts, _issue_state_fetcher, _turn_number, _max_turns) do
+  defp continue_active_issue(_app_session, _workspace, refreshed_issue, _codex_update_recipient, _opts, _issue_state_fetcher, _turn_number, _max_turns, _provider) do
     Logger.info("Reached agent.max_turns for #{issue_context(refreshed_issue)} with issue still active; returning control to orchestrator")
 
     :ok

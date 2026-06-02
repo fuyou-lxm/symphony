@@ -6,9 +6,12 @@ defmodule SymphonyElixirWeb.Router do
   use Phoenix.Router
   import Phoenix.LiveView.Router
 
+  alias SymphonyElixirWeb.DashboardLocale
+
   pipeline :browser do
     plug(:fetch_session)
     plug(:fetch_live_flash)
+    plug(:put_dashboard_locale)
     plug(:put_root_layout, html: {SymphonyElixirWeb.Layouts, :root})
     plug(:protect_from_forgery)
     plug(:put_secure_browser_headers)
@@ -29,13 +32,22 @@ defmodule SymphonyElixirWeb.Router do
 
   scope "/", SymphonyElixirWeb do
     get("/api/v1/state", ObservabilityApiController, :state)
+    get("/api/v1/memory", ObservabilityApiController, :memory)
 
     match(:*, "/", ObservabilityApiController, :method_not_allowed)
     match(:*, "/api/v1/state", ObservabilityApiController, :method_not_allowed)
+    match(:*, "/api/v1/memory", ObservabilityApiController, :method_not_allowed)
     post("/api/v1/refresh", ObservabilityApiController, :refresh)
     match(:*, "/api/v1/refresh", ObservabilityApiController, :method_not_allowed)
     get("/api/v1/:issue_identifier", ObservabilityApiController, :issue)
     match(:*, "/api/v1/:issue_identifier", ObservabilityApiController, :method_not_allowed)
     match(:*, "/*path", ObservabilityApiController, :not_found)
+  end
+
+  defp put_dashboard_locale(conn, _opts) do
+    conn = Plug.Conn.fetch_query_params(conn)
+    locale = DashboardLocale.resolve(conn.query_params)
+
+    Plug.Conn.assign(conn, :locale, locale)
   end
 end
