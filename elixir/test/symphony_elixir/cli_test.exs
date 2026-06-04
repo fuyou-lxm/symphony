@@ -1,6 +1,8 @@
 defmodule SymphonyElixir.CLITest do
   use ExUnit.Case, async: true
 
+  import ExUnit.CaptureIO
+
   alias SymphonyElixir.CLI
 
   @ack_flag "--i-understand-that-this-will-be-running-without-the-usual-guardrails"
@@ -52,7 +54,9 @@ defmodule SymphonyElixir.CLITest do
       ensure_all_started: fn -> {:ok, [:symphony_elixir]} end
     }
 
-    assert :ok = CLI.evaluate([@ack_flag], deps)
+    capture_io(fn ->
+      assert :ok = CLI.evaluate([@ack_flag], deps)
+    end)
   end
 
   test "uses an explicit workflow path override when provided" do
@@ -74,7 +78,10 @@ defmodule SymphonyElixir.CLITest do
       ensure_all_started: fn -> {:ok, [:symphony_elixir]} end
     }
 
-    assert :ok = CLI.evaluate([@ack_flag, workflow_path], deps)
+    capture_io(fn ->
+      assert :ok = CLI.evaluate([@ack_flag, workflow_path], deps)
+    end)
+
     assert_received {:workflow_checked, ^expanded_path}
     assert_received {:workflow_set, ^expanded_path}
   end
@@ -93,7 +100,10 @@ defmodule SymphonyElixir.CLITest do
       ensure_all_started: fn -> {:ok, [:symphony_elixir]} end
     }
 
-    assert :ok = CLI.evaluate([@ack_flag, "--logs-root", "tmp/custom-logs", "WORKFLOW.md"], deps)
+    capture_io(fn ->
+      assert :ok = CLI.evaluate([@ack_flag, "--logs-root", "tmp/custom-logs", "WORKFLOW.md"], deps)
+    end)
+
     assert_received {:logs_root, expanded_path}
     assert expanded_path == Path.expand("tmp/custom-logs")
   end
@@ -107,22 +117,46 @@ defmodule SymphonyElixir.CLITest do
       ensure_all_started: fn -> {:ok, [:symphony_elixir]} end
     }
 
-    assert {:error, message} = CLI.evaluate([@ack_flag, "WORKFLOW.md"], deps)
-    assert message =~ "Workflow file not found:"
+    output =
+      capture_io(fn ->
+        assert {:error, message} = CLI.evaluate([@ack_flag, "WORKFLOW.md"], deps)
+        assert message =~ "Workflow file not found:"
+      end)
+
+    assert output == ""
   end
 
   test "returns startup error when app cannot start" do
+    workflow_path = "WORKFLOW.en.powerchat-agy.md"
+    expanded_workflow_path = Path.expand(workflow_path)
+    logs_root = "tmp/failing-real-agy-run"
+    expanded_logs_root = Path.expand(logs_root)
+
     deps = %{
-      file_regular?: fn _path -> true end,
+      file_regular?: fn path -> path == expanded_workflow_path end,
       set_workflow_file_path: fn _path -> :ok end,
       set_logs_root: fn _path -> :ok end,
       set_server_port_override: fn _port -> :ok end,
       ensure_all_started: fn -> {:error, :boom} end
     }
 
-    assert {:error, message} = CLI.evaluate([@ack_flag, "WORKFLOW.md"], deps)
-    assert message =~ "Failed to start Symphony with workflow"
-    assert message =~ ":boom"
+    output =
+      capture_io(fn ->
+        assert {:error, message} =
+                 CLI.evaluate(
+                   [@ack_flag, "--logs-root", logs_root, "--port", "4011", workflow_path],
+                   deps
+                 )
+
+        assert message =~ "Failed to start Symphony with workflow"
+        assert message =~ ":boom"
+      end)
+
+    assert output =~ "Starting Symphony..."
+    assert output =~ "Workflow: #{expanded_workflow_path}"
+    assert output =~ "Logs: #{Path.join(expanded_logs_root, "log/symphony.log")}"
+    assert output =~ "Dashboard/API: http://127.0.0.1:4011/"
+    refute output =~ "Symphony started"
   end
 
   test "returns ok when workflow exists and app starts" do
@@ -134,6 +168,40 @@ defmodule SymphonyElixir.CLITest do
       ensure_all_started: fn -> {:ok, [:symphony_elixir]} end
     }
 
-    assert :ok = CLI.evaluate([@ack_flag, "WORKFLOW.md"], deps)
+    capture_io(fn ->
+      assert :ok = CLI.evaluate([@ack_flag, "WORKFLOW.md"], deps)
+    end)
+  end
+
+  test "prints a startup summary when the app starts" do
+    workflow_path = "WORKFLOW.en.powerchat-agy.md"
+    expanded_workflow_path = Path.expand(workflow_path)
+    logs_root = "tmp/real-agy-run-20260604-120000"
+    expanded_logs_root = Path.expand(logs_root)
+    port = 4011
+
+    deps = %{
+      file_regular?: fn path -> path == expanded_workflow_path end,
+      set_workflow_file_path: fn _path -> :ok end,
+      set_logs_root: fn _path -> :ok end,
+      set_server_port_override: fn _port -> :ok end,
+      ensure_all_started: fn -> {:ok, [:symphony_elixir]} end
+    }
+
+    output =
+      capture_io(fn ->
+        assert :ok =
+                 CLI.evaluate(
+                   [@ack_flag, "--logs-root", logs_root, "--port", Integer.to_string(port), workflow_path],
+                   deps
+                 )
+      end)
+
+    assert output =~ "Starting Symphony..."
+    assert output =~ "Symphony started"
+    assert output =~ "Workflow: #{expanded_workflow_path}"
+    assert output =~ "Logs: #{Path.join(expanded_logs_root, "log/symphony.log")}"
+    assert output =~ "Dashboard/API: http://127.0.0.1:4011/"
+    assert output =~ "Press Ctrl-C to stop."
   end
 end

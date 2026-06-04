@@ -33,18 +33,10 @@ defmodule SymphonyElixir.CLI do
   def evaluate(args, deps \\ runtime_deps()) do
     case OptionParser.parse(args, strict: @switches) do
       {opts, [], []} ->
-        with :ok <- require_guardrails_acknowledgement(opts),
-             :ok <- maybe_set_logs_root(opts, deps),
-             :ok <- maybe_set_server_port(opts, deps) do
-          run(Path.expand("WORKFLOW.md"), deps)
-        end
+        start(Path.expand("WORKFLOW.md"), opts, deps)
 
       {opts, [workflow_path], []} ->
-        with :ok <- require_guardrails_acknowledgement(opts),
-             :ok <- maybe_set_logs_root(opts, deps),
-             :ok <- maybe_set_server_port(opts, deps) do
-          run(workflow_path, deps)
-        end
+        start(workflow_path, opts, deps)
 
       _ ->
         {:error, usage_message()}
@@ -56,23 +48,49 @@ defmodule SymphonyElixir.CLI do
     expanded_path = Path.expand(workflow_path)
 
     if deps.file_regular?.(expanded_path) do
-      :ok = deps.set_workflow_file_path.(expanded_path)
-
-      case deps.ensure_all_started.() do
-        {:ok, _started_apps} ->
-          :ok
-
-        {:error, reason} ->
-          {:error, "Failed to start Symphony with workflow #{expanded_path}: #{inspect(reason)}"}
-      end
+      start_runtime(expanded_path, deps)
     else
       {:error, "Workflow file not found: #{expanded_path}"}
+    end
+  end
+
+  defp start_runtime(expanded_path, deps) do
+    :ok = deps.set_workflow_file_path.(expanded_path)
+
+    case deps.ensure_all_started.() do
+      {:ok, _started_apps} ->
+        :ok
+
+      {:error, reason} ->
+        {:error, "Failed to start Symphony with workflow #{expanded_path}: #{inspect(reason)}"}
     end
   end
 
   @spec usage_message() :: String.t()
   defp usage_message do
     "Usage: symphony [--logs-root <path>] [--port <port>] [path-to-WORKFLOW.md]"
+  end
+
+  defp start(workflow_path, opts, deps) do
+    expanded_path = Path.expand(workflow_path)
+
+    with :ok <- require_guardrails_acknowledgement(opts),
+         :ok <- maybe_set_logs_root(opts, deps),
+         :ok <- maybe_set_server_port(opts, deps),
+         :ok <- require_workflow_file(expanded_path, deps),
+         :ok <- print_startup_plan(expanded_path, opts),
+         :ok <- run(expanded_path, deps) do
+      print_startup_ready()
+      :ok
+    end
+  end
+
+  defp require_workflow_file(expanded_path, deps) do
+    if deps.file_regular?.(expanded_path) do
+      :ok
+    else
+      {:error, "Workflow file not found: #{expanded_path}"}
+    end
   end
 
   @spec runtime_deps() :: deps()
@@ -167,6 +185,39 @@ defmodule SymphonyElixir.CLI do
   defp set_server_port_override(port) when is_integer(port) and port >= 0 do
     Application.put_env(:symphony_elixir, :server_port_override, port)
     :ok
+  end
+
+  defp print_startup_plan(workflow_path, opts) do
+    IO.puts([
+      "Starting Symphony...\n",
+      "Workflow: #{Path.expand(workflow_path)}\n",
+      "Logs: #{startup_log_file(opts)}\n",
+      "Dashboard/API: #{dashboard_summary(opts)}"
+    ])
+
+    :ok
+  end
+
+  defp print_startup_ready do
+    IO.puts("Symphony started. Press Ctrl-C to stop.")
+  end
+
+  defp startup_log_file(opts) do
+    opts
+    |> Keyword.get_values(:logs_root)
+    |> case do
+      [] -> LogFile.default_log_file()
+      values -> values |> List.last() |> Path.expand() |> LogFile.default_log_file()
+    end
+  end
+
+  defp dashboard_summary(opts) do
+    opts
+    |> Keyword.get_values(:port)
+    |> case do
+      [] -> "disabled; pass --port <port> to enable it."
+      values -> "http://127.0.0.1:#{List.last(values)}/"
+    end
   end
 
   @spec wait_for_shutdown() :: no_return()
