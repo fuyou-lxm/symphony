@@ -182,14 +182,30 @@ defmodule SymphonyElixir.CoreTest do
 
     assert {:ok, %{config: config, prompt_template: prompt}} = Workflow.load(workflow_path)
 
+    after_create = config |> Map.fetch!("hooks") |> Map.fetch!("after_create")
     before_run = config |> Map.fetch!("hooks") |> Map.fetch!("before_run")
 
+    assert after_create =~ "git clone --depth 1"
+    assert after_create =~ "packages/spark-chat/package.json"
+    refute after_create =~ "npm ci"
+    refute after_create =~ "npm install"
+    refute after_create =~ "pnpm install"
     assert before_run =~ ".symphony/start_powerchat_preview.sh"
+    assert before_run =~ ".symphony/ensure_powerchat_deps.sh"
+    assert before_run =~ "SYMPHONY_PNPM_STORE_DIR"
+
+    assert before_run =~
+             "pnpm install --store-dir \"$PNPM_STORE_DIR\" --frozen-lockfile --config.dangerouslyAllowAllBuilds=true --prefer-offline"
+
+    assert before_run =~ "pnpm run dev"
+    refute before_run =~ ~r/(^|[^[:alnum:]_-])npm run dev/
     assert before_run =~ "SYMPHONY_POWERCHAT_AUTO_START_PREVIEW:-0"
     assert before_run =~ "SYMPHONY_POWERCHAT_NODE_MAX_OLD_SPACE_MB:-256"
     assert before_run =~ "--max-old-space-size="
     assert prompt =~ "on demand"
+    assert prompt =~ "pnpm"
     assert prompt =~ ".symphony/start_powerchat_preview.sh"
+    assert prompt =~ ".symphony/ensure_powerchat_deps.sh"
   end
 
   test "Antigravity PowerChat before_run hook does not start preview by default" do
@@ -221,6 +237,210 @@ defmodule SymphonyElixir.CoreTest do
     refute env =~ "POWERCHAT_URL="
     refute File.exists?(Path.join([workspace, ".symphony", "powerchat.pid"]))
     assert File.exists?(Path.join([workspace, ".symphony", "start_powerchat_preview.sh"]))
+    assert File.exists?(Path.join([workspace, ".symphony", "ensure_powerchat_deps.sh"]))
+
+    ensure_deps = File.read!(Path.join([workspace, ".symphony", "ensure_powerchat_deps.sh"]))
+    assert ensure_deps =~ "pnpm-lock.yaml"
+    assert ensure_deps =~ "package-lock.json"
+    assert ensure_deps =~ "pnpm import"
+    assert ensure_deps =~ "corepack enable"
+    assert ensure_deps =~ "SYMPHONY_PNPM_STORE_DIR"
+    assert ensure_deps =~ "SYMPHONY_PNPM_LOCK_CACHE_DIR"
+    assert ensure_deps =~ "cleanup_generated_pnpm_lock"
+
+    assert ensure_deps =~
+             "pnpm install --store-dir \"$PNPM_STORE_DIR\" --frozen-lockfile --config.dangerouslyAllowAllBuilds=true --prefer-offline"
+
+    refute ensure_deps =~ "pnpm config set store-dir"
+    refute ensure_deps =~ "npm ci"
+    refute ensure_deps =~ ~r/(^|[^[:alnum:]_-])npm install/
+  end
+
+  test "Antigravity PowerChat dependency helper imports package lock and installs with pnpm store" do
+    test_root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-elixir-powerchat-agy-pnpm-#{System.unique_integer([:positive])}"
+      )
+
+    on_exit(fn -> File.rm_rf(test_root) end)
+
+    workflow_path = Path.expand("WORKFLOW.en.powerchat-agy.md", File.cwd!())
+    assert {:ok, %{config: config}} = Workflow.load(workflow_path)
+    before_run = config |> Map.fetch!("hooks") |> Map.fetch!("before_run")
+    workspace = Path.join(test_root, "MT-AGY-PNPM")
+    spark_chat = Path.join([workspace, "packages", "spark-chat"])
+    fake_bin = Path.join(test_root, "bin")
+    pnpm_calls = Path.join(test_root, "pnpm.calls")
+    pnpm_lock_cache = Path.join(test_root, "pnpm-lock-cache")
+
+    File.mkdir_p!(spark_chat)
+    File.mkdir_p!(fake_bin)
+    File.write!(Path.join(spark_chat, "package.json"), ~s({"scripts":{"dev":"dumi dev"}}))
+    File.write!(Path.join(spark_chat, "package-lock.json"), ~s({"lockfileVersion":3}))
+    File.write!(Path.join(fake_bin, "corepack"), "#!/bin/sh\nexit 0\n")
+
+    File.write!(
+      Path.join(fake_bin, "pnpm"),
+      """
+      #!/bin/sh
+      printf '%s\\n' "$*" >> "#{pnpm_calls}"
+      if [ "$1" = "import" ]; then
+        printf 'lockfileVersion: "9.0"\\n' > pnpm-lock.yaml
+      fi
+      exit 0
+      """
+    )
+
+    File.chmod!(Path.join(fake_bin, "corepack"), 0o755)
+    File.chmod!(Path.join(fake_bin, "pnpm"), 0o755)
+
+    write_workflow_file!(Workflow.workflow_file_path(),
+      workspace_root: test_root,
+      hook_before_run: before_run
+    )
+
+    assert :ok = Workspace.run_before_run_hook(workspace, "MT-AGY-PNPM")
+
+    ensure_deps = Path.join([workspace, ".symphony", "ensure_powerchat_deps.sh"])
+
+    env = [
+      {"PATH", fake_bin <> ":" <> System.get_env("PATH", "")},
+      {"SYMPHONY_PNPM_STORE_DIR", Path.join(test_root, "shared-pnpm-store")},
+      {"SYMPHONY_PNPM_LOCK_CACHE_DIR", pnpm_lock_cache}
+    ]
+
+    assert {_, 0} = System.cmd(ensure_deps, [], cd: workspace, env: env, stderr_to_stdout: true)
+    assert {_, 0} = System.cmd(ensure_deps, [], cd: workspace, env: env, stderr_to_stdout: true)
+
+    refute File.exists?(Path.join(spark_chat, "pnpm-lock.yaml"))
+    assert length(Path.wildcard(Path.join([pnpm_lock_cache, "*", "pnpm-lock.yaml"]))) == 1
+
+    calls = File.read!(pnpm_calls)
+    call_lines = String.split(calls, "\n", trim: true)
+    assert Enum.count(call_lines, &(&1 == "import")) == 1
+
+    assert calls =~
+             "install --store-dir #{Path.join(test_root, "shared-pnpm-store")} --frozen-lockfile --config.dangerouslyAllowAllBuilds=true --prefer-offline"
+
+    assert Enum.count(call_lines, &String.starts_with?(&1, "install ")) == 2
+    refute calls =~ ~r/(^|[^[:alnum:]_-])npm/
+  end
+
+  test "Antigravity PowerChat dependency helper preserves an existing pnpm lockfile" do
+    test_root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-elixir-powerchat-agy-pnpm-existing-#{System.unique_integer([:positive])}"
+      )
+
+    on_exit(fn -> File.rm_rf(test_root) end)
+
+    workflow_path = Path.expand("WORKFLOW.en.powerchat-agy.md", File.cwd!())
+    assert {:ok, %{config: config}} = Workflow.load(workflow_path)
+    before_run = config |> Map.fetch!("hooks") |> Map.fetch!("before_run")
+    workspace = Path.join(test_root, "MT-AGY-PNPM-EXISTING")
+    spark_chat = Path.join([workspace, "packages", "spark-chat"])
+    fake_bin = Path.join(test_root, "bin")
+    pnpm_calls = Path.join(test_root, "pnpm.calls")
+
+    File.mkdir_p!(spark_chat)
+    File.mkdir_p!(fake_bin)
+    File.write!(Path.join(spark_chat, "package.json"), ~s({"scripts":{"dev":"dumi dev"}}))
+    File.write!(Path.join(spark_chat, "pnpm-lock.yaml"), "lockfileVersion: '9.0'\n")
+
+    File.write!(
+      Path.join(fake_bin, "pnpm"),
+      """
+      #!/bin/sh
+      printf '%s\\n' "$*" >> "#{pnpm_calls}"
+      exit 0
+      """
+    )
+
+    File.chmod!(Path.join(fake_bin, "pnpm"), 0o755)
+
+    write_workflow_file!(Workflow.workflow_file_path(),
+      workspace_root: test_root,
+      hook_before_run: before_run
+    )
+
+    assert :ok = Workspace.run_before_run_hook(workspace, "MT-AGY-PNPM-EXISTING")
+
+    ensure_deps = Path.join([workspace, ".symphony", "ensure_powerchat_deps.sh"])
+
+    env = [
+      {"PATH", fake_bin <> ":" <> System.get_env("PATH", "")},
+      {"SYMPHONY_PNPM_STORE_DIR", Path.join(test_root, "shared-pnpm-store")}
+    ]
+
+    assert {_, 0} = System.cmd(ensure_deps, [], cd: workspace, env: env, stderr_to_stdout: true)
+
+    assert File.read!(Path.join(spark_chat, "pnpm-lock.yaml")) == "lockfileVersion: '9.0'\n"
+
+    calls = File.read!(pnpm_calls)
+    refute calls =~ "import"
+
+    assert calls =~
+             "install --store-dir #{Path.join(test_root, "shared-pnpm-store")} --frozen-lockfile --config.dangerouslyAllowAllBuilds=true --prefer-offline"
+  end
+
+  test "Antigravity PowerChat dependency helper cleans temporary pnpm lockfile after install failure" do
+    test_root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-elixir-powerchat-agy-pnpm-fail-#{System.unique_integer([:positive])}"
+      )
+
+    on_exit(fn -> File.rm_rf(test_root) end)
+
+    workflow_path = Path.expand("WORKFLOW.en.powerchat-agy.md", File.cwd!())
+    assert {:ok, %{config: config}} = Workflow.load(workflow_path)
+    before_run = config |> Map.fetch!("hooks") |> Map.fetch!("before_run")
+    workspace = Path.join(test_root, "MT-AGY-PNPM-FAIL")
+    spark_chat = Path.join([workspace, "packages", "spark-chat"])
+    fake_bin = Path.join(test_root, "bin")
+    pnpm_calls = Path.join(test_root, "pnpm.calls")
+
+    File.mkdir_p!(spark_chat)
+    File.mkdir_p!(fake_bin)
+    File.write!(Path.join(spark_chat, "package.json"), ~s({"scripts":{"dev":"dumi dev"}}))
+    File.write!(Path.join(spark_chat, "package-lock.json"), ~s({"lockfileVersion":3}))
+
+    File.write!(
+      Path.join(fake_bin, "pnpm"),
+      """
+      #!/bin/sh
+      printf '%s\\n' "$*" >> "#{pnpm_calls}"
+      if [ "$1" = "import" ]; then
+        printf 'lockfileVersion: "9.0"\\n' > pnpm-lock.yaml
+        exit 0
+      fi
+      exit 42
+      """
+    )
+
+    File.chmod!(Path.join(fake_bin, "pnpm"), 0o755)
+
+    write_workflow_file!(Workflow.workflow_file_path(),
+      workspace_root: test_root,
+      hook_before_run: before_run
+    )
+
+    assert :ok = Workspace.run_before_run_hook(workspace, "MT-AGY-PNPM-FAIL")
+
+    ensure_deps = Path.join([workspace, ".symphony", "ensure_powerchat_deps.sh"])
+
+    env = [
+      {"PATH", fake_bin <> ":" <> System.get_env("PATH", "")},
+      {"SYMPHONY_PNPM_STORE_DIR", Path.join(test_root, "shared-pnpm-store")},
+      {"SYMPHONY_PNPM_LOCK_CACHE_DIR", Path.join(test_root, "pnpm-lock-cache")}
+    ]
+
+    assert {_, 42} = System.cmd(ensure_deps, [], cd: workspace, env: env, stderr_to_stdout: true)
+
+    refute File.exists?(Path.join(spark_chat, "pnpm-lock.yaml"))
+    assert File.read!(pnpm_calls) =~ "install"
   end
 
   test "Antigravity PowerChat workflow reserves realistic memory for each cold-start dispatch" do

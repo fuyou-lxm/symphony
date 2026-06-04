@@ -28,14 +28,6 @@ hooks:
       exit 1
     fi
 
-    if [ -f packages/spark-chat/package-lock.json ] && command -v npm >/dev/null 2>&1; then
-      (cd packages/spark-chat && npm ci)
-    elif command -v npm >/dev/null 2>&1; then
-      (cd packages/spark-chat && npm install)
-    else
-      echo "npm is required to prepare packages/spark-chat" >&2
-      exit 1
-    fi
   before_run: |
     set -e
     WORKSPACE_ROOT=$(pwd -P)
@@ -77,6 +69,74 @@ hooks:
       kill -9 "$TAILWIND_PID" >/dev/null 2>&1 || true
     done
 
+    cat > .symphony/ensure_powerchat_deps.sh <<'POWERCHAT_DEPS'
+    #!/bin/sh
+    set -e
+    WORKSPACE_ROOT=$(pwd -P)
+    SPARK_CHAT_DIR="packages/spark-chat"
+
+    if [ ! -f "$SPARK_CHAT_DIR/package.json" ]; then
+      echo "$SPARK_CHAT_DIR/package.json not found" >&2
+      exit 1
+    fi
+
+    if ! command -v pnpm >/dev/null 2>&1; then
+      if command -v corepack >/dev/null 2>&1; then
+        corepack enable pnpm >/dev/null 2>&1 || corepack enable >/dev/null 2>&1 || true
+      fi
+    fi
+
+    if ! command -v pnpm >/dev/null 2>&1; then
+      echo "pnpm is required to prepare $SPARK_CHAT_DIR; install pnpm or enable Corepack" >&2
+      exit 1
+    fi
+
+    PNPM_CACHE_ROOT="${HOME:-$WORKSPACE_ROOT/.symphony}"
+    PNPM_STORE_DIR="${SYMPHONY_PNPM_STORE_DIR:-$PNPM_CACHE_ROOT/.cache/symphony/pnpm-store}"
+    PNPM_LOCK_CACHE_ROOT="${SYMPHONY_PNPM_LOCK_CACHE_DIR:-$PNPM_CACHE_ROOT/.cache/symphony/pnpm-locks}"
+    mkdir -p "$PNPM_STORE_DIR" "$PNPM_LOCK_CACHE_ROOT"
+
+    GENERATED_PNPM_LOCK=0
+
+    cleanup_generated_pnpm_lock() {
+      if [ "$GENERATED_PNPM_LOCK" = "1" ]; then
+        rm -f "$SPARK_CHAT_DIR/pnpm-lock.yaml"
+      fi
+    }
+
+    trap cleanup_generated_pnpm_lock EXIT
+
+    if [ ! -f "$SPARK_CHAT_DIR/pnpm-lock.yaml" ]; then
+      if [ ! -f "$SPARK_CHAT_DIR/package-lock.json" ]; then
+        echo "$SPARK_CHAT_DIR/pnpm-lock.yaml not found and $SPARK_CHAT_DIR/package-lock.json is unavailable for pnpm import" >&2
+        exit 1
+      fi
+
+      PNPM_LOCK_CACHE_KEY=$( (cksum "$SPARK_CHAT_DIR/package.json"; cksum "$SPARK_CHAT_DIR/package-lock.json") | cksum | awk '{print $1 "-" $2}' )
+      PNPM_LOCK_CACHE_DIR="$PNPM_LOCK_CACHE_ROOT/$PNPM_LOCK_CACHE_KEY"
+      PNPM_LOCK_CACHE_FILE="$PNPM_LOCK_CACHE_DIR/pnpm-lock.yaml"
+      GENERATED_PNPM_LOCK=1
+
+      if [ -f "$PNPM_LOCK_CACHE_FILE" ]; then
+        cp "$PNPM_LOCK_CACHE_FILE" "$SPARK_CHAT_DIR/pnpm-lock.yaml"
+      else
+        (cd "$SPARK_CHAT_DIR" && pnpm import)
+        mkdir -p "$PNPM_LOCK_CACHE_DIR"
+        cp "$SPARK_CHAT_DIR/pnpm-lock.yaml" "$PNPM_LOCK_CACHE_FILE.$$"
+        mv "$PNPM_LOCK_CACHE_FILE.$$" "$PNPM_LOCK_CACHE_FILE"
+      fi
+    fi
+
+    if [ "${SYMPHONY_PNPM_OFFLINE:-0}" = "1" ]; then
+      (cd "$SPARK_CHAT_DIR" && pnpm install --store-dir "$PNPM_STORE_DIR" --frozen-lockfile --config.dangerouslyAllowAllBuilds=true --offline)
+    else
+      (cd "$SPARK_CHAT_DIR" && pnpm install --store-dir "$PNPM_STORE_DIR" --frozen-lockfile --config.dangerouslyAllowAllBuilds=true --prefer-offline)
+    fi
+
+    cleanup_generated_pnpm_lock
+    trap - EXIT
+    POWERCHAT_DEPS
+
     cat > .symphony/start_powerchat_preview.sh <<'POWERCHAT_PREVIEW'
     #!/bin/sh
     set -e
@@ -111,6 +171,8 @@ hooks:
       rm -f .symphony/powerchat.pid
     fi
 
+    ./.symphony/ensure_powerchat_deps.sh
+
     PORT_BASE=43000
     PORT_RANGE=1000
     HASH=$(printf '%s' "$PWD" | cksum | awk '{print $1}')
@@ -136,7 +198,7 @@ hooks:
     fi
 
     NODE_OPTIONS_VALUE="${NODE_OPTIONS:+$NODE_OPTIONS }--max-old-space-size=$NODE_HEAP_MB"
-    nohup sh -c 'tail -f /dev/null | (cd packages/spark-chat && exec env BROWSER=none CHECK_TIMEOUT=30 NODE_OPTIONS="$2" PORT="$1" npm run dev)' sh "$PORT" "$NODE_OPTIONS_VALUE" < /dev/null > "$WORKSPACE_ROOT/.symphony/powerchat.log" 2>&1 &
+    nohup sh -c 'tail -f /dev/null | (cd packages/spark-chat && exec env BROWSER=none CHECK_TIMEOUT=30 NODE_OPTIONS="$2" PORT="$1" pnpm run dev)' sh "$PORT" "$NODE_OPTIONS_VALUE" < /dev/null > "$WORKSPACE_ROOT/.symphony/powerchat.log" 2>&1 &
     echo $! > .symphony/powerchat.pid
 
     PID=$(cat .symphony/powerchat.pid)
@@ -146,6 +208,7 @@ hooks:
       if curl -fsS "$POWERCHAT_URL" >/dev/null 2>&1; then
         {
           echo "POWERCHAT_PREVIEW_MODE=running"
+          echo "POWERCHAT_PACKAGE_MANAGER=pnpm"
           echo "POWERCHAT_PORT=$PORT"
           echo "POWERCHAT_URL=$POWERCHAT_URL"
           echo "POWERCHAT_NODE_MAX_OLD_SPACE_MB=$NODE_HEAP_MB"
@@ -168,10 +231,11 @@ hooks:
     exit 1
     POWERCHAT_PREVIEW
 
-    chmod +x .symphony/start_powerchat_preview.sh
+    chmod +x .symphony/ensure_powerchat_deps.sh .symphony/start_powerchat_preview.sh
 
     {
       echo "POWERCHAT_PREVIEW_MODE=on_demand"
+      echo "POWERCHAT_PACKAGE_MANAGER=pnpm"
       echo "POWERCHAT_NODE_MAX_OLD_SPACE_MB=${SYMPHONY_POWERCHAT_NODE_MAX_OLD_SPACE_MB:-256}"
       echo "POWERCHAT_START_COMMAND=./.symphony/start_powerchat_preview.sh"
     } > .symphony/powerchat.env
@@ -329,7 +393,7 @@ Execution rules:
 4. Symphony itself runs from its own repository checkout, but each issue workspace is bootstrapped from the target repository configured in `hooks.after_create` above.
 5. Work only inside the current issue workspace. Do not modify any other path.
 6. Any content written back to Linear should default to Chinese, and should be concise, clear, and reviewer-oriented.
-7. PowerChat preview starts on demand to keep parallel runs low-memory. Read `.symphony/powerchat.env`; if `POWERCHAT_PREVIEW_MODE=on_demand`, run `./.symphony/start_powerchat_preview.sh` from the workspace before browser validation or review preview work, then reread `.symphony/powerchat.env` for `POWERCHAT_URL`. Do not assume a fixed port. The script starts the same Spark Chat dumi dev server used by `pnpm run start:spark-chat`, but runs it from `packages/spark-chat` after dependency bootstrap to avoid repeated unattended installs.
+7. PowerChat preview starts on demand to keep parallel runs low-memory. Read `.symphony/powerchat.env`; if `POWERCHAT_PREVIEW_MODE=on_demand`, run `./.symphony/start_powerchat_preview.sh` from the workspace before browser validation or review preview work, then reread `.symphony/powerchat.env` for `POWERCHAT_URL`. Do not assume a fixed port. The script starts the same Spark Chat dumi dev server used by `pnpm run start:spark-chat`, but runs it from `packages/spark-chat` after pnpm-only dependency bootstrap. For direct PowerChat build, test, or lint commands, run `./.symphony/ensure_powerchat_deps.sh` first if dependencies are not already prepared. The helper uses a shared pnpm store (`SYMPHONY_PNPM_STORE_DIR`) and can import an existing `package-lock.json` into a cached temporary `pnpm-lock.yaml` when the target repository has not committed a pnpm lockfile yet; do not run npm install commands as a fallback.
 
 ## Prerequisite: Linear capability is available
 
