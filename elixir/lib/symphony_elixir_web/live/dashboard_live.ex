@@ -190,7 +190,7 @@ defmodule SymphonyElixirWeb.DashboardLive do
                     </td>
                     <td>
                       <div class="detail-stack">
-                        <span class="mono numeric"><%= entry.finalized_at || t(@locale, :not_available) %></span>
+                        <span class="mono numeric"><%= format_visible_time(entry.finalized_at, @locale) %></span>
                         <span class="muted"><%= entry.reason || t(@locale, :not_available) %></span>
                       </div>
                     </td>
@@ -290,7 +290,7 @@ defmodule SymphonyElixirWeb.DashboardLive do
                         <span class="muted event-meta">
                           <%= entry.last_event || t(@locale, :not_available) %>
                           <%= if entry.last_event_at do %>
-                            · <span class="mono numeric"><%= entry.last_event_at %></span>
+                            · <span class="mono numeric"><%= format_visible_time(entry.last_event_at, @locale) %></span>
                           <% end %>
                         </span>
                       </div>
@@ -373,7 +373,7 @@ defmodule SymphonyElixirWeb.DashboardLive do
                       </div>
                     </td>
                     <td class="mono"><%= entry.token_policy || t(@locale, :not_available) %></td>
-                    <td class="mono numeric"><%= entry.last_checked_at || t(@locale, :not_available) %></td>
+                    <td class="mono numeric"><%= format_visible_time(entry.last_checked_at, @locale) %></td>
                     <td>
                       <div class="detail-stack">
                         <span><%= entry.next_action || t(@locale, :not_available) %></span>
@@ -441,7 +441,7 @@ defmodule SymphonyElixirWeb.DashboardLive do
                         <span class="muted"><%= t(@locale, :not_available) %></span>
                       <% end %>
                     </td>
-                    <td class="mono"><%= entry.blocked_at || t(@locale, :not_available) %></td>
+                    <td class="mono"><%= format_visible_time(entry.blocked_at, @locale) %></td>
                     <td>
                       <div class="detail-stack">
                         <span
@@ -451,7 +451,7 @@ defmodule SymphonyElixirWeb.DashboardLive do
                         <span class="muted event-meta">
                           <%= entry.last_event || t(@locale, :not_available) %>
                           <%= if entry.last_event_at do %>
-                            · <span class="mono numeric"><%= entry.last_event_at %></span>
+                            · <span class="mono numeric"><%= format_visible_time(entry.last_event_at, @locale) %></span>
                           <% end %>
                         </span>
                       </div>
@@ -572,6 +572,35 @@ defmodule SymphonyElixirWeb.DashboardLive do
   end
 
   defp unix_seconds(_datetime), do: nil
+
+  defp format_visible_time(nil, locale), do: t(locale, :not_available)
+
+  defp format_visible_time(%DateTime{} = datetime, locale) do
+    format_beijing_time(DateTime.shift_zone!(datetime, "Etc/UTC"), locale)
+  end
+
+  defp format_visible_time(datetime, locale) when is_binary(datetime) do
+    case DateTime.from_iso8601(datetime) do
+      {:ok, parsed, _offset} -> format_visible_time(parsed, locale)
+      _ -> datetime
+    end
+  end
+
+  defp format_visible_time(_datetime, locale), do: t(locale, :not_available)
+
+  defp format_beijing_time(%DateTime{} = datetime, locale) do
+    datetime
+    |> DateTime.add(8 * 60 * 60, :second)
+    |> DateTime.to_naive()
+    |> NaiveDateTime.truncate(:second)
+    |> NaiveDateTime.to_string()
+    |> then(fn timestamp ->
+      case locale do
+        @zh_locale -> "北京时间 #{timestamp}"
+        _ -> "#{timestamp} CST"
+      end
+    end)
+  end
 
   defp format_int(value, _locale) when is_integer(value) do
     value

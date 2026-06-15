@@ -1652,17 +1652,12 @@ defmodule SymphonyElixir.StatusDashboard do
   end
 
   defp humanize_codex_method("antigravity_cli/event/log", payload) do
-    text =
-      map_path(payload, ["params", "text"]) ||
-        map_path(payload, [:params, :text]) ||
-        map_path(payload, ["params", "text_preview"]) ||
-        map_path(payload, [:params, :text_preview])
+    status = antigravity_cli_log_param(payload, "status")
+    category = antigravity_cli_log_param(payload, "category")
 
-    if is_binary(text) and String.trim(text) != "" do
-      "antigravity cli log: #{inline_text(text)}"
-    else
-      "antigravity cli log updated"
-    end
+    payload
+    |> antigravity_cli_log_text()
+    |> humanize_antigravity_cli_log(antigravity_cli_log_prefix(status, category))
   end
 
   defp humanize_codex_method("antigravity_cli/event/stdout", payload) do
@@ -1701,6 +1696,41 @@ defmodule SymphonyElixir.StatusDashboard do
       method
     end
   end
+
+  defp antigravity_cli_log_prefix(status, category) when is_binary(status) and is_binary(category),
+    do: "antigravity cli #{status}/#{category}"
+
+  defp antigravity_cli_log_prefix(status, _category) when is_binary(status), do: "antigravity cli #{status}"
+  defp antigravity_cli_log_prefix(_status, category) when is_binary(category), do: "antigravity cli #{category}"
+  defp antigravity_cli_log_prefix(_status, _category), do: "antigravity cli log"
+
+  defp antigravity_cli_log_param(payload, key) do
+    map_path(payload, ["params", key]) ||
+      map_path(payload, [:params, antigravity_cli_log_atom_key(key)])
+  end
+
+  defp antigravity_cli_log_atom_key("category"), do: :category
+  defp antigravity_cli_log_atom_key("status"), do: :status
+  defp antigravity_cli_log_atom_key("summary"), do: :summary
+  defp antigravity_cli_log_atom_key("text"), do: :text
+  defp antigravity_cli_log_atom_key("text_preview"), do: :text_preview
+
+  defp antigravity_cli_log_text(payload) do
+    antigravity_cli_log_param(payload, "summary") ||
+      antigravity_cli_log_param(payload, "text") ||
+      antigravity_cli_log_param(payload, "text_preview")
+  end
+
+  defp humanize_antigravity_cli_log(text, prefix) when is_binary(text) do
+    if String.trim(text) != "" do
+      "#{prefix}: #{inline_text(text)}"
+    else
+      humanize_antigravity_cli_log(nil, prefix)
+    end
+  end
+
+  defp humanize_antigravity_cli_log(_text, "antigravity cli log"), do: "antigravity cli log updated"
+  defp humanize_antigravity_cli_log(_text, prefix), do: "#{prefix} updated"
 
   defp humanize_dynamic_tool_event(base, payload) do
     case dynamic_tool_name(payload) do

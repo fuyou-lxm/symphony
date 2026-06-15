@@ -59,32 +59,40 @@ defmodule SymphonyElixir.AgentRunner do
 
   defp forward_codex_update?(message) do
     if antigravity_cli_log_update?(message) do
-      now_ms = System.monotonic_time(:millisecond)
-      last_sent = Process.get(:symphony_last_antigravity_log_update)
-      turn_id = antigravity_cli_log_turn_id(message)
-
-      forward? =
-        case last_sent do
-          %{sent_at_ms: last_sent_at_ms, turn_id: ^turn_id} when is_integer(last_sent_at_ms) ->
-            now_ms - last_sent_at_ms >= @antigravity_log_update_interval_ms
-
-          _ ->
-            true
-        end
-
-      if forward? do
-        Process.put(:symphony_last_antigravity_log_update, %{sent_at_ms: now_ms, turn_id: turn_id})
-      end
-
-      forward?
+      antigravity_cli_fatal_log_update?(message) or forward_throttled_antigravity_cli_log_update?(message)
     else
       true
     end
   end
 
+  defp forward_throttled_antigravity_cli_log_update?(message) do
+    now_ms = System.monotonic_time(:millisecond)
+    last_sent = Process.get(:symphony_last_antigravity_log_update)
+    turn_id = antigravity_cli_log_turn_id(message)
+
+    forward? =
+      case last_sent do
+        %{sent_at_ms: last_sent_at_ms, turn_id: ^turn_id} when is_integer(last_sent_at_ms) ->
+          now_ms - last_sent_at_ms >= @antigravity_log_update_interval_ms
+
+        _ ->
+          true
+      end
+
+    if forward? do
+      Process.put(:symphony_last_antigravity_log_update, %{sent_at_ms: now_ms, turn_id: turn_id})
+    end
+
+    forward?
+  end
+
   defp antigravity_cli_log_update?(%{payload: %{payload: %{"method" => "antigravity_cli/event/log"}}}), do: true
   defp antigravity_cli_log_update?(%{payload: %{"method" => "antigravity_cli/event/log"}}), do: true
   defp antigravity_cli_log_update?(_message), do: false
+
+  defp antigravity_cli_fatal_log_update?(%{payload: %{payload: %{"params" => %{"fatal" => true}}}}), do: true
+  defp antigravity_cli_fatal_log_update?(%{payload: %{"params" => %{"fatal" => true}}}), do: true
+  defp antigravity_cli_fatal_log_update?(_message), do: false
 
   defp antigravity_cli_log_turn_id(%{payload: %{payload: %{"params" => %{"turn_id" => turn_id}}}}) when is_binary(turn_id), do: turn_id
   defp antigravity_cli_log_turn_id(%{payload: %{"params" => %{"turn_id" => turn_id}}}) when is_binary(turn_id), do: turn_id

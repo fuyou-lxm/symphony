@@ -1969,6 +1969,61 @@ defmodule SymphonyElixir.OrchestratorStatusTest do
              "antigravity cli stdout captured (64000 bytes, stderr 12 bytes)"
   end
 
+  test "status dashboard summarizes structured Antigravity CLI log activity" do
+    running_message = %{
+      event: :notification,
+      message: %{
+        payload: %{
+          "method" => "antigravity_cli/event/log",
+          "params" => %{
+            "status" => "running",
+            "category" => "activity",
+            "summary" => "Print mode: streaming output"
+          }
+        }
+      }
+    }
+
+    failed_message = %{
+      event: :notification,
+      message: %{
+        payload: %{
+          "method" => "antigravity_cli/event/log",
+          "params" => %{
+            "status" => "failed",
+            "category" => "auth_required",
+            "fatal" => true,
+            "summary" => "You are not logged into Antigravity."
+          }
+        }
+      }
+    }
+
+    quota_message = %{
+      event: :notification,
+      message: %{
+        payload: %{
+          "method" => "antigravity_cli/event/log",
+          "params" => %{
+            "status" => "failed",
+            "category" => "quota_exhausted",
+            "fatal" => true,
+            "summary" => "RESOURCE_EXHAUSTED (code 429): Individual quota reached."
+          }
+        }
+      }
+    }
+
+    assert StatusDashboard.humanize_codex_message(running_message) ==
+             "antigravity cli running/activity: Print mode: streaming output"
+
+    assert StatusDashboard.humanize_codex_message(failed_message) ==
+             "antigravity cli failed/auth_required: You are not logged into Antigravity."
+
+    assert StatusDashboard.humanize_codex_message(quota_message) ==
+             "antigravity cli failed/quota_exhausted: RESOURCE_EXHAUSTED (code 429): Individual quota reached."
+  end
+
   test "status dashboard formats auto-approval updates from codex" do
     message = %{
       event: :approval_auto_approved,

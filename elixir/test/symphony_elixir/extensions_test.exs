@@ -1011,6 +1011,49 @@ defmodule SymphonyElixir.ExtensionsTest do
     refute html =~ "Running sessions"
   end
 
+  test "dashboard liveview renders visible event timestamps in Beijing time for Chinese locale" do
+    orchestrator_name = Module.concat(__MODULE__, :ChineseDashboardTimestampOrchestrator)
+    event_at = ~U[2026-06-04 12:36:42Z]
+
+    snapshot =
+      static_snapshot()
+      |> Map.put(:rate_limits, nil)
+      |> Map.update!(:running, fn [entry] ->
+        [
+          %{
+            entry
+            | last_codex_event: :session_started,
+              last_codex_message: %{event: :session_started, message: %{}, timestamp: event_at},
+              last_codex_timestamp: event_at
+          }
+        ]
+      end)
+      |> Map.update!(:blocked, fn [entry] ->
+        [%{entry | blocked_at: event_at, last_codex_timestamp: event_at}]
+      end)
+      |> Map.update!(:external_waiting, fn [entry] ->
+        [%{entry | last_checked_at: event_at}]
+      end)
+      |> Map.update!(:recent_external_finalizations, fn [entry] ->
+        [%{entry | finalized_at: event_at}]
+      end)
+
+    {:ok, _pid} =
+      StaticOrchestrator.start_link(
+        name: orchestrator_name,
+        snapshot: snapshot,
+        refresh: %{queued: false, coalesced: false, requested_at: event_at, operations: []}
+      )
+
+    start_test_endpoint(orchestrator: orchestrator_name, snapshot_timeout_ms: 50)
+
+    {:ok, _view, html} = live(build_conn(), "/?lang=zh-CN")
+
+    assert html =~ "session started"
+    assert html =~ "北京时间 2026-06-04 20:36:42"
+    refute html =~ "2026-06-04T12:36:42Z"
+  end
+
   test "dashboard liveview renders an unavailable state without crashing" do
     start_test_endpoint(
       orchestrator: Module.concat(__MODULE__, :MissingDashboardOrchestrator),

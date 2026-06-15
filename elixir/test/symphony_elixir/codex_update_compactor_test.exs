@@ -53,7 +53,15 @@ defmodule SymphonyElixir.CodexUpdateCompactorTest do
           "params" => %{
             "text" => large_text,
             "conversation_id" => "agy-thread",
-            "turn_id" => "turn-1"
+            "turn_id" => "turn-1",
+            "offset_start" => 1024,
+            "offset_end" => 2048,
+            "bytes_read" => 1024,
+            "bytes_available" => byte_size(large_text),
+            "status" => "failed",
+            "category" => "auth_required",
+            "fatal" => true,
+            "summary" => "You are not logged into Antigravity."
           }
         },
         raw: large_text
@@ -72,6 +80,14 @@ defmodule SymphonyElixir.CodexUpdateCompactorTest do
 
     assert params["text_bytes"] == byte_size(large_text)
     assert params["conversation_id"] == "agy-thread"
+    assert params["offset_start"] == 1024
+    assert params["offset_end"] == 2048
+    assert params["bytes_read"] == 1024
+    assert params["bytes_available"] == byte_size(large_text)
+    assert params["status"] == "failed"
+    assert params["category"] == "auth_required"
+    assert params["fatal"] == true
+    assert params["summary"] == "You are not logged into Antigravity."
     assert byte_size(params["text_preview"]) <= 243
     refute Map.has_key?(params, "text")
     refute inspect(params) =~ large_text

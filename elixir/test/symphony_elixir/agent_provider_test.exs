@@ -154,6 +154,13 @@ defmodule SymphonyElixir.AgentProviderTest do
                  get_in(message, [:payload, :payload, "params", "text"]) == "first cli response\n"
              end)
 
+      session_started_messages = Enum.filter(emitted, &(&1.event == :session_started))
+
+      assert [
+               %{session_id: "antigravity-cli-agy-turn-1", payload: %{session_id: "antigravity-cli-agy-turn-1"}},
+               %{session_id: "agy-thread-1-agy-turn-2", payload: %{session_id: "agy-thread-1-agy-turn-2"}}
+             ] = session_started_messages
+
       trace = trace_file |> File.read!() |> String.split("\n", trim: true) |> Enum.map(&Jason.decode!/1)
       assert [first_call, second_call] = trace
       assert {:ok, canonical_workspace} = SymphonyElixir.PathSafety.canonicalize(workspace)
@@ -548,13 +555,26 @@ defmodule SymphonyElixir.AgentProviderTest do
                         payload: %{
                           payload: %{
                             "method" => "antigravity_cli/event/log",
-                            "params" => %{"text" => log_text}
+                            "params" => %{
+                              "text" => log_text,
+                              "status" => "running",
+                              "category" => "activity",
+                              "offset_start" => 0,
+                              "offset_end" => offset_end,
+                              "bytes_read" => bytes_read,
+                              "bytes_available" => bytes_available,
+                              "summary" => summary
+                            }
                           }
                         }
                       }},
                      3_000
 
       assert log_text =~ "Print mode: starting"
+      assert offset_end >= byte_size(log_text)
+      assert bytes_read == byte_size(log_text)
+      assert bytes_available >= bytes_read
+      assert summary =~ "Print mode: starting"
       refute Task.yield(task, 0)
 
       assert {:ok, _turn} = Task.await(task, 5_000)
@@ -633,6 +653,275 @@ defmodule SymphonyElixir.AgentProviderTest do
       assert Enum.any?(log_messages, fn message ->
                get_in(message, [:payload, :payload, "params", "text"]) =~ "log tick"
              end)
+
+      assert Enum.all?(log_messages, fn message ->
+               params = get_in(message, [:payload, :payload, "params"])
+
+               params["status"] == "running" and
+                 params["category"] == "activity" and
+                 is_integer(params["offset_start"]) and
+                 is_integer(params["offset_end"]) and
+                 params["offset_end"] >= params["offset_start"] and
+                 is_integer(params["bytes_read"]) and
+                 params["bytes_read"] <= 16_384 and
+                 is_integer(params["bytes_available"]) and
+                 is_binary(params["summary"])
+             end)
+    after
+      File.rm_rf(test_root)
+    end
+  end
+
+  test "antigravity CLI provider classifies auth failures from log activity without waiting for print timeout" do
+    test_root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-elixir-antigravity-cli-auth-fatal-#{System.unique_integer([:positive])}"
+      )
+
+    try do
+      workspace_root = Path.join(test_root, "workspaces")
+      workspace = Path.join(workspace_root, "MT-AGY-AUTH-FATAL")
+      fake_agy = Path.join(test_root, "fake-agy-auth-fatal")
+      test_pid = self()
+
+      File.mkdir_p!(workspace)
+
+      File.write!(fake_agy, """
+      #!/bin/sh
+      log_file=""
+
+      while [ "$#" -gt 0 ]; do
+        case "$1" in
+          --log-file=*)
+            log_file="${1#--log-file=}"
+            ;;
+        esac
+        shift
+      done
+
+      mkdir -p "$(dirname "$log_file")"
+      printf 'E0604 16:27:22.110616 11514 log.go:398] error getting token source: You are not logged into Antigravity.\\n' >> "$log_file"
+      sleep 5
+      """)
+
+      File.chmod!(fake_agy, 0o755)
+
+      write_workflow_file!(Workflow.workflow_file_path(),
+        workspace_root: workspace_root,
+        agent_provider: "antigravity_cli",
+        antigravity_cli_command: fake_agy,
+        antigravity_cli_turn_timeout_ms: 5_000
+      )
+
+      issue = %Issue{
+        id: "issue-antigravity-cli-auth-fatal",
+        identifier: "MT-AGY-AUTH-FATAL",
+        title: "Auth fatal",
+        description: "",
+        state: "In Progress",
+        labels: []
+      }
+
+      {:ok, session} = AntigravityCli.start_session(workspace)
+
+      started_ms = System.monotonic_time(:millisecond)
+
+      assert {:error, {:antigravity_cli_fatal, :auth_required, message}} =
+               AntigravityCli.run_turn(session, "Prompt", issue,
+                 on_message: fn message ->
+                   send(test_pid, {:antigravity_cli_message, message})
+                 end
+               )
+
+      elapsed_ms = System.monotonic_time(:millisecond) - started_ms
+
+      assert message =~ "not logged into Antigravity"
+      assert elapsed_ms < 3_000
+
+      assert_receive {:antigravity_cli_message,
+                      %{
+                        event: :notification,
+                        payload: %{
+                          payload: %{
+                            "method" => "antigravity_cli/event/log",
+                            "params" => %{
+                              "status" => "failed",
+                              "category" => "auth_required",
+                              "fatal" => true,
+                              "summary" => summary
+                            }
+                          }
+                        }
+                      }},
+                     1_000
+
+      assert summary =~ "not logged into Antigravity"
+      assert :ok = AntigravityCli.stop_session(session)
+    after
+      File.rm_rf(test_root)
+    end
+  end
+
+  test "antigravity CLI provider classifies quota exhaustion from log activity without waiting for stall" do
+    test_root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-elixir-antigravity-cli-quota-fatal-#{System.unique_integer([:positive])}"
+      )
+
+    try do
+      workspace_root = Path.join(test_root, "workspaces")
+      workspace = Path.join(workspace_root, "MT-AGY-QUOTA-FATAL")
+      fake_agy = Path.join(test_root, "fake-agy-quota-fatal")
+      test_pid = self()
+
+      File.mkdir_p!(workspace)
+
+      File.write!(fake_agy, """
+      #!/bin/sh
+      log_file=""
+
+      while [ "$#" -gt 0 ]; do
+        case "$1" in
+          --log-file=*)
+            log_file="${1#--log-file=}"
+            ;;
+        esac
+        shift
+      done
+
+      mkdir -p "$(dirname "$log_file")"
+      printf 'E0604 21:12:20.722782 20656 log.go:398] agent executor error: RESOURCE_EXHAUSTED (code 429): Individual quota reached. Contact your administrator to enable overages. Resets in 43m16s.\\n' >> "$log_file"
+      sleep 5
+      """)
+
+      File.chmod!(fake_agy, 0o755)
+
+      write_workflow_file!(Workflow.workflow_file_path(),
+        workspace_root: workspace_root,
+        agent_provider: "antigravity_cli",
+        antigravity_cli_command: fake_agy,
+        antigravity_cli_turn_timeout_ms: 5_000
+      )
+
+      issue = %Issue{
+        id: "issue-antigravity-cli-quota-fatal",
+        identifier: "MT-AGY-QUOTA-FATAL",
+        title: "Quota fatal",
+        description: "",
+        state: "In Progress",
+        labels: []
+      }
+
+      {:ok, session} = AntigravityCli.start_session(workspace)
+
+      started_ms = System.monotonic_time(:millisecond)
+
+      assert {:error, {:antigravity_cli_fatal, :quota_exhausted, message}} =
+               AntigravityCli.run_turn(session, "Prompt", issue,
+                 on_message: fn message ->
+                   send(test_pid, {:antigravity_cli_message, message})
+                 end
+               )
+
+      elapsed_ms = System.monotonic_time(:millisecond) - started_ms
+
+      assert message =~ "RESOURCE_EXHAUSTED"
+      assert message =~ "Individual quota reached"
+      assert elapsed_ms < 3_000
+
+      assert_receive {:antigravity_cli_message,
+                      %{
+                        event: :notification,
+                        payload: %{
+                          payload: %{
+                            "method" => "antigravity_cli/event/log",
+                            "params" => %{
+                              "status" => "failed",
+                              "category" => "quota_exhausted",
+                              "fatal" => true,
+                              "summary" => summary
+                            }
+                          }
+                        }
+                      }},
+                     1_000
+
+      assert summary =~ "RESOURCE_EXHAUSTED"
+      assert summary =~ "Individual quota reached"
+      assert :ok = AntigravityCli.stop_session(session)
+    after
+      File.rm_rf(test_root)
+    end
+  end
+
+  test "antigravity CLI provider classifies fatal patterns near the tail of large log growth" do
+    test_root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-elixir-antigravity-cli-large-tail-fatal-#{System.unique_integer([:positive])}"
+      )
+
+    try do
+      workspace_root = Path.join(test_root, "workspaces")
+      workspace = Path.join(workspace_root, "MT-AGY-LARGE-TAIL-FATAL")
+      fake_agy = Path.join(test_root, "fake-agy-large-tail-fatal")
+
+      File.mkdir_p!(workspace)
+
+      File.write!(fake_agy, """
+      #!/bin/sh
+      log_file=""
+
+      while [ "$#" -gt 0 ]; do
+        case "$1" in
+          --log-file=*)
+            log_file="${1#--log-file=}"
+            ;;
+        esac
+        shift
+      done
+
+      mkdir -p "$(dirname "$log_file")"
+      python3 - "$log_file" <<'PY'
+      import sys
+
+      path = sys.argv[1]
+
+      with open(path, "ab") as log:
+          log.write(b"I0601 server.go:755] Created conversation agy-large-tail-fatal\\n")
+          log.write(b"x" * 120000)
+          log.write(b"\\nE0604 log.go:398] error getting token source: You are not logged into Antigravity.\\n")
+      PY
+      sleep 5
+      """)
+
+      File.chmod!(fake_agy, 0o755)
+
+      write_workflow_file!(Workflow.workflow_file_path(),
+        workspace_root: workspace_root,
+        agent_provider: "antigravity_cli",
+        antigravity_cli_command: fake_agy,
+        antigravity_cli_turn_timeout_ms: 5_000
+      )
+
+      issue = %Issue{
+        id: "issue-antigravity-cli-large-tail-fatal",
+        identifier: "MT-AGY-LARGE-TAIL-FATAL",
+        title: "Large tail fatal",
+        description: "",
+        state: "In Progress",
+        labels: []
+      }
+
+      {:ok, session} = AntigravityCli.start_session(workspace)
+
+      assert {:error, {:antigravity_cli_fatal, :auth_required, message}} =
+               AntigravityCli.run_turn(session, "Prompt", issue)
+
+      assert message =~ "not logged into Antigravity"
+      assert :ok = AntigravityCli.stop_session(session)
     after
       File.rm_rf(test_root)
     end
